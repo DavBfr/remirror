@@ -1,4 +1,4 @@
-package main
+package remirror
 
 import (
 	"database/sql"

@@ -1,41 +1,32 @@
-package main
+package remirror
 
 import (
-	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
-func main() {
-	configPath := flag.String("config", "remirror.hcl", "Path to config file")
-	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging")
-	flag.Parse()
-	verbose = *verboseFlag
-
-	if flag.NArg() > 0 {
-		log.Fatalf("Unhandled arguments: %v", flag.Args())
-	}
+// Run configures and starts the remirror server.
+func Run(configPath string, enableVerbose bool) error {
+	verbose = enableVerbose
 
 	config := &Config{}
-
-	if err := load_configs(config, *configPath); err != nil {
-		log.Fatalf("Config error: %v", err)
+	if err := load_configs(config, configPath); err != nil {
+		return fmt.Errorf("config error: %w", err)
 	}
 	if err := apply_env_overrides(config); err != nil {
-		log.Fatalf("Env override error: %v", err)
+		return fmt.Errorf("env override error: %w", err)
 	}
 	cacheRoot = config.Data
 
 	// Initialize HTTP client with connection timeout (not total request timeout)
-	connectTimeout := 30 * time.Second // default timeout
+	connectTimeout := 30 * time.Second
 	if config.UpstreamTimeout != "" {
 		parsed, err := time.ParseDuration(config.UpstreamTimeout)
 		if err != nil {
-			log.Fatalf("Invalid upstream_timeout value: %v", err)
+			return fmt.Errorf("invalid upstream_timeout value: %w", err)
 		}
 		connectTimeout = parsed
 	}
@@ -53,7 +44,7 @@ func main() {
 
 	// Initialize metadata database for ETag storage
 	if err := init_metadata_db(config.Data); err != nil {
-		log.Fatalf("Failed to initialize metadata database: %v", err)
+		return fmt.Errorf("failed to initialize metadata database: %w", err)
 	}
 	defer metaDB.Close()
 	vlog("metadata database initialized in %s", config.Data)
@@ -74,5 +65,5 @@ func main() {
 	}
 
 	log.Println("remirror listening on HTTP", config.Listen, "with data cache", config.Data)
-	log.Fatal(http.ListenAndServe(config.Listen, nil))
+	return http.ListenAndServe(config.Listen, nil)
 }

@@ -19,7 +19,7 @@ Caching HTTP proxy for distro and toolchain mirrors. It sits in front of one or 
 You need a working Go installation (<https://golang.org/doc/install>).
 
 ```sh
-go build .
+go build ./cmd/remirror
 ./remirror
 ```
 

@@ -1,11 +1,24 @@
-package main
+package remirror
 
 import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 )
+
+type Match struct {
+	Pattern string `hcl:"pattern"`
+	Action  string `hcl:"action"`
+	Rewrite bool   `hcl:"rewrite"`
+}
+
+type compiledMatch struct {
+	regex   *regexp.Regexp
+	action  string
+	rewrite bool
+}
 
 func parse_matches(value string) ([]Match, error) {
 	if strings.TrimSpace(value) == "" {
@@ -87,4 +100,30 @@ func handle_client_conditionals(w http.ResponseWriter, r *http.Request, request_
 	}
 
 	return false
+}
+
+func compile_mirror_matches(mirror *Mirror) error {
+	mirror.compiledMatches = make([]*compiledMatch, 0, len(mirror.Matches))
+	for i, m := range mirror.Matches {
+		if m.Pattern == "" {
+			return fmt.Errorf("Match rule %d has empty pattern", i)
+		}
+		re, err := regexp.Compile(m.Pattern)
+		if err != nil {
+			return fmt.Errorf("Match rule %d pattern %q: %w", i, m.Pattern, err)
+		}
+		action := m.Action
+		if action == "" {
+			action = "cache" // default action
+		}
+		if action != "cache" && action != "try" && action != "skip" {
+			return fmt.Errorf("Match rule %d has invalid action %q (must be cache, try, or skip)", i, action)
+		}
+		mirror.compiledMatches = append(mirror.compiledMatches, &compiledMatch{
+			regex:   re,
+			action:  action,
+			rewrite: m.Rewrite,
+		})
+	}
+	return nil
 }
