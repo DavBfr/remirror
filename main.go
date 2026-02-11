@@ -23,6 +23,11 @@ import (
 
 const VERSION = "0.0.6"
 
+// Headers to exclude when making upstream requests (in addition to hop-by-hop headers)
+var excludeHeadersUpstream = map[string]bool{
+	"Range": true, // Always request full file from upstream, handle ranges locally
+}
+
 type Config struct {
 	Listen  string // HTTP listen address. ":8080"
 	Data    string // Storage location for cached files. "/var/remirror"
@@ -129,6 +134,13 @@ func set_cache_metadata_headers(w http.ResponseWriter, etag, lastModified string
 	if lastModified != "" {
 		w.Header().Set("Last-Modified", lastModified)
 	}
+	// Always advertise that we support range requests
+	w.Header().Set("Accept-Ranges", "bytes")
+}
+
+// shouldExcludeHeader checks if a header should be excluded when proxying upstream
+func shouldExcludeHeader(k string) bool {
+	return hopHeaders[k] || excludeHeadersUpstream[k]
 }
 
 func touch_metadata(filePath string) {
@@ -138,7 +150,7 @@ func touch_metadata(filePath string) {
 	// Normalize the path to remove cacheRoot prefix
 	filePath = normalize_path(filePath)
 	if _, err := metaDB.Exec(
-		`UPDATE etags SET updated_at = ? WHERE path = ?`,
+		`UPDATE files SET updated_at = ? WHERE path = ?`,
 		time.Now().UTC().Format(time.RFC3339), filePath,
 	); err != nil {
 		vlog("metadata touch failed for %s: %v", filePath, err)
@@ -249,7 +261,7 @@ func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) er
 
 	// Copy headers from original request
 	for k, vs := range r.Header {
-		if !hopHeaders[k] {
+		if !shouldExcludeHeader(k) {
 			for _, v := range vs {
 				req.Header.Add(k, v)
 			}
@@ -276,6 +288,7 @@ func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) er
 	}
 
 	w.Header().Set("Server", "remirror")
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream response body
@@ -400,7 +413,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				}
 
 				for k, vs := range r.Header {
-					if !hopHeaders[k] {
+					if !shouldExcludeHeader(k) {
 						for _, v := range vs {
 							req.Header.Add(k, v)
 						}
@@ -506,7 +519,6 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				}()
 
 				write_resp_headers(w, resp)
-				vlog("upstream response %d for %s", resp.StatusCode, remote_url)
 
 				n, err := io.Copy(out, resp.Body)
 				if err != nil {
@@ -607,6 +619,13 @@ func load_configs(config *Config, configPath string) error {
 func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler) bool {
 	// Don't revalidate on Range requests
 	if r.Header.Get("Range") != "" {
+		// For range requests on cached files, serve directly with cache metadata
+		touch_metadata(local_path)
+		etag, lastModified, _ := get_metadata(local_path)
+		if lastModified == "" {
+			lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
+		}
+		set_cache_metadata_headers(w, etag, lastModified)
 		fileserver.ServeHTTP(w, r)
 		return true
 	}
@@ -639,9 +658,9 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	vlog("revalidate If-Modified-Since for %s: %s", local_path, ims)
 	vlog_headers("revalidate request", req.Header)
 
-	// Copy original request headers
+	// Copy original request headers (excluding Range for revalidation)
 	for k, vs := range r.Header {
-		if !hopHeaders[k] {
+		if !shouldExcludeHeader(k) {
 			for _, v := range vs {
 				req.Header.Add(k, v)
 			}
@@ -894,7 +913,7 @@ func init_metadata_db(dataPath string) error {
 
 	// Create the metadata table
 	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS etags (
+		CREATE TABLE IF NOT EXISTS files (
 			path TEXT PRIMARY KEY,
 			etag TEXT NOT NULL,
 			last_modified DATETIME NOT NULL,
@@ -903,7 +922,7 @@ func init_metadata_db(dataPath string) error {
 	`)
 	if err != nil {
 		db.Close()
-		return fmt.Errorf("failed to create etags table: %w", err)
+		return fmt.Errorf("failed to create files table: %w", err)
 	}
 
 	metaDB = db
@@ -937,7 +956,7 @@ func store_metadata(filePath, etag, lastModified string) error {
 	// Avoid updating updated_at when metadata hasn't changed.
 	var existingEtag string
 	var existingLastModified string
-	err := metaDB.QueryRow(`SELECT etag, last_modified FROM etags WHERE path = ?`, filePath).Scan(&existingEtag, &existingLastModified)
+	err := metaDB.QueryRow(`SELECT etag, last_modified FROM files WHERE path = ?`, filePath).Scan(&existingEtag, &existingLastModified)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
@@ -959,7 +978,7 @@ func store_metadata(filePath, etag, lastModified string) error {
 	}
 
 	_, err = metaDB.Exec(
-		`INSERT OR REPLACE INTO etags (path, etag, last_modified, updated_at) VALUES (?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO files (path, etag, last_modified, updated_at) VALUES (?, ?, ?, ?)`,
 		filePath, etag, lastModified, time.Now().UTC().Format(time.RFC3339),
 	)
 	return err
@@ -976,7 +995,7 @@ func get_metadata(filePath string) (string, string, error) {
 
 	var etag string
 	var lastModified string
-	err := metaDB.QueryRow(`SELECT etag, last_modified FROM etags WHERE path = ?`, filePath).Scan(&etag, &lastModified)
+	err := metaDB.QueryRow(`SELECT etag, last_modified FROM files WHERE path = ?`, filePath).Scan(&etag, &lastModified)
 	if err == sql.ErrNoRows {
 		vlog("metadata not found for %s", filePath)
 		return "", "", nil // No metadata stored, not an error
@@ -1048,6 +1067,7 @@ func write_resp_headers(w http.ResponseWriter, resp *http.Response) {
 	}
 
 	w.Header().Set("Server", "remirror")
+	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(resp.StatusCode)
 }
 
