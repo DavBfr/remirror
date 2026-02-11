@@ -101,6 +101,7 @@ var (
 	http_client = http.Client{}
 	metaDB      *sql.DB
 	verbose     bool
+	cacheRoot   string
 
 	downloads_mu sync.Mutex
 	downloads    = map[string]*Download{}
@@ -130,6 +131,20 @@ func set_cache_metadata_headers(w http.ResponseWriter, etag, lastModified string
 	}
 }
 
+func touch_metadata(filePath string) {
+	if metaDB == nil {
+		return
+	}
+	// Normalize the path to remove cacheRoot prefix
+	filePath = normalize_path(filePath)
+	if _, err := metaDB.Exec(
+		`UPDATE etags SET updated_at = ? WHERE path = ?`,
+		time.Now().UTC().Format(time.RFC3339), filePath,
+	); err != nil {
+		vlog("metadata touch failed for %s: %v", filePath, err)
+	}
+}
+
 func etag_matches(headerValue, etag string) bool {
 	if headerValue == "*" {
 		return true
@@ -154,6 +169,7 @@ func handle_client_conditionals(w http.ResponseWriter, r *http.Request, local_pa
 	if inm := r.Header.Get("If-None-Match"); inm != "" && etag != "" {
 		if etag_matches(inm, etag) {
 			vlog("conditional If-None-Match hit for %s", local_path)
+			touch_metadata(local_path)
 			set_cache_metadata_headers(w, etag, lastModified)
 			w.Header().Set("Server", "remirror")
 			w.WriteHeader(http.StatusNotModified)
@@ -169,6 +185,7 @@ func handle_client_conditionals(w http.ResponseWriter, r *http.Request, local_pa
 			}
 			if !modTime.After(imsTime) {
 				vlog("conditional If-Modified-Since hit for %s", local_path)
+				touch_metadata(local_path)
 				set_cache_metadata_headers(w, etag, lastModified)
 				w.Header().Set("Server", "remirror")
 				w.WriteHeader(http.StatusNotModified)
@@ -184,6 +201,7 @@ func serve_cached(w http.ResponseWriter, r *http.Request, local_path string, fil
 	if handle_client_conditionals(w, r, local_path, fileInfo) {
 		return
 	}
+	touch_metadata(local_path)
 	etag, lastModified, _ := get_metadata(local_path)
 	if lastModified == "" {
 		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
@@ -892,11 +910,29 @@ func init_metadata_db(dataPath string) error {
 	return nil
 }
 
+// normalize_path removes the cacheRoot prefix from a file path
+func normalize_path(filePath string) string {
+	if cacheRoot == "" {
+		return filePath
+	}
+	prefix := cacheRoot
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	if strings.HasPrefix(filePath, prefix) {
+		return strings.TrimPrefix(filePath, prefix)
+	}
+	return filePath
+}
+
 // store_metadata saves ETag and Last-Modified for a given file path
 func store_metadata(filePath, etag, lastModified string) error {
 	if metaDB == nil {
 		return fmt.Errorf("metadata database not initialized")
 	}
+
+	// Normalize the path to remove cacheRoot prefix
+	filePath = normalize_path(filePath)
 
 	// Avoid updating updated_at when metadata hasn't changed.
 	var existingEtag string
@@ -935,6 +971,9 @@ func get_metadata(filePath string) (string, string, error) {
 		return "", "", fmt.Errorf("metadata database not initialized")
 	}
 
+	// Normalize the path to remove cacheRoot prefix
+	filePath = normalize_path(filePath)
+
 	var etag string
 	var lastModified string
 	err := metaDB.QueryRow(`SELECT etag, last_modified FROM etags WHERE path = ?`, filePath).Scan(&etag, &lastModified)
@@ -971,6 +1010,7 @@ func main() {
 	if err := apply_env_overrides(config); err != nil {
 		log.Fatalf("Env override error: %v", err)
 	}
+	cacheRoot = config.Data
 
 	// Initialize metadata database for ETag storage
 	if err := init_metadata_db(config.Data); err != nil {

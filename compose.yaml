@@ -7,15 +7,15 @@ services:
       - ./data:/var/remirror
     develop:
       watch:
-        - path: /main.go
+        - path: main.go
           action: rebuild
-        - path: /misc.go
+        - path: misc.go
           action: rebuild
-        - path: ./go.mod
+        - path: go.mod
           action: rebuild
-        - path: ./go.sum
+        - path: go.sum
           action: rebuild
-        - path: ./Dockerfile
+        - path: Dockerfile
           action: rebuild
-        - path: ./remirror.hcl
+        - path: remirror.hcl
           action: rebuild
