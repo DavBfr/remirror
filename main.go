@@ -115,6 +115,7 @@ func (mirror Mirror) String() string {
 var (
 	http_client = http.Client{}
 	metaDB      *sql.DB
+	metaDB_mu   sync.Mutex // Protects database write operations
 	verbose     bool
 	cacheRoot   string
 
@@ -185,78 +186,12 @@ func decompressResponseBody(resp *http.Response) (io.ReadCloser, error) {
 	}
 }
 
-func touch_metadata(filePath string) {
-	if metaDB == nil {
+func serve_cached(w http.ResponseWriter, r *http.Request, request_path string, fileInfo os.FileInfo, fileserver http.Handler) {
+	if handle_client_conditionals(w, r, request_path, fileInfo) {
 		return
 	}
-	// Normalize the path to remove cacheRoot prefix
-	filePath = normalize_path(filePath)
-	if _, err := metaDB.Exec(
-		`UPDATE files SET updated_at = ? WHERE path = ?`,
-		time.Now().UTC().Format(time.RFC3339), filePath,
-	); err != nil {
-		vlog("metadata touch failed for %s: %v", filePath, err)
-	}
-}
-
-func etag_matches(headerValue, etag string) bool {
-	if headerValue == "*" {
-		return true
-	}
-	for _, part := range strings.Split(headerValue, ",") {
-		if strings.TrimSpace(part) == etag {
-			return true
-		}
-	}
-	return false
-}
-
-func handle_client_conditionals(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo) bool {
-	etag, lastModified, metaErr := get_metadata(local_path)
-	if metaErr != nil {
-		vlog("conditional metadata lookup failed for %s: %v", local_path, metaErr)
-	}
-	if lastModified == "" {
-		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
-	}
-
-	if inm := r.Header.Get("If-None-Match"); inm != "" && etag != "" {
-		if etag_matches(inm, etag) {
-			vlog("conditional If-None-Match hit for %s", local_path)
-			touch_metadata(local_path)
-			set_cache_metadata_headers(w, etag, lastModified)
-			w.Header().Set("Server", "remirror")
-			w.WriteHeader(http.StatusNotModified)
-			return true
-		}
-	}
-
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		if imsTime, err := http.ParseTime(ims); err == nil {
-			modTime := fileInfo.ModTime().UTC()
-			if lmTime, lmErr := http.ParseTime(lastModified); lmErr == nil {
-				modTime = lmTime.UTC()
-			}
-			if !modTime.After(imsTime) {
-				vlog("conditional If-Modified-Since hit for %s", local_path)
-				touch_metadata(local_path)
-				set_cache_metadata_headers(w, etag, lastModified)
-				w.Header().Set("Server", "remirror")
-				w.WriteHeader(http.StatusNotModified)
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-func serve_cached(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, fileserver http.Handler) {
-	if handle_client_conditionals(w, r, local_path, fileInfo) {
-		return
-	}
-	touch_metadata(local_path)
-	etag, lastModified, _ := get_metadata(local_path)
+	touch_metadata(request_path)
+	etag, lastModified, _, _ := get_metadata(request_path)
 	if lastModified == "" {
 		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
 	}
@@ -265,24 +200,24 @@ func serve_cached(w http.ResponseWriter, r *http.Request, local_path string, fil
 }
 
 // serve_cached_with_rewrite serves cached content with URL rewriting if needed
-func serve_cached_with_rewrite(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, fileserver http.Handler, shouldRewrite bool, upstreamURL string, replacementURL string) {
+func serve_cached_with_rewrite(w http.ResponseWriter, r *http.Request, request_path string, storage_path string, fileInfo os.FileInfo, fileserver http.Handler, shouldRewrite bool, upstreamURL string, replacementURL string) {
 	if !shouldRewrite {
-		serve_cached(w, r, local_path, fileInfo, fileserver)
+		serve_cached(w, r, request_path, fileInfo, fileserver)
 		return
 	}
 
-	if handle_client_conditionals(w, r, local_path, fileInfo) {
+	if handle_client_conditionals(w, r, request_path, fileInfo) {
 		return
 	}
-	touch_metadata(local_path)
-	etag, lastModified, _ := get_metadata(local_path)
+	touch_metadata(request_path)
+	etag, lastModified, _, _ := get_metadata(request_path)
 	if lastModified == "" {
 		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
 	}
 	set_cache_metadata_headers(w, etag, lastModified)
 
 	// Read file, rewrite, and serve
-	content, err := ioutil.ReadFile(local_path)
+	content, err := ioutil.ReadFile(storage_path)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -432,7 +367,8 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 
 			for _, upstream := range upstreams {
 
-				local_path := ""
+				request_path := path.Clean(r.URL.Path) // Logical path from request
+				var storage_path string                // Physical storage path (from DB or computed)
 				remote_url := upstream.Scheme + "://" + upstream.Host
 
 				// Ugh... This is not the right way to do this.
@@ -479,41 +415,51 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					return nil
 				}
 
-				local_path = config.Data + path.Clean(r.URL.Path)
-
-				// Check if we have a cached version
-				fileInfo, err := os.Stat(local_path)
-				if err == nil {
-					vlog("cache hit: %s", local_path)
-					// We have a cached file
-					if mirror.should_revalidate(remote_url) {
-						// Revalidate files matching action="try" patterns
-						if revalidate_cache(w, r, local_path, fileInfo, remote_url, fileserver, shouldRewrite, upstreamBase, replacementURL) {
+				// Check if we have a cached version by looking up in database
+				_, _, foundStoragePath, metaErr := get_metadata(request_path)
+				if metaErr == nil {
+					// We have a cache entry, verify file exists
+					storage_path = foundStoragePath
+					fileInfo, statErr := os.Stat(storage_path)
+					if statErr == nil {
+						vlog("cache hit: %s (stored at %s)", request_path, storage_path)
+						// We have a cached file
+						if mirror.should_revalidate(remote_url) {
+							// Revalidate files matching action="try" patterns
+							if revalidate_cache(w, r, request_path, storage_path, fileInfo, remote_url, fileserver, shouldRewrite, upstreamBase, replacementURL) {
+								return nil
+							}
+							// Revalidation indicated we need to download
+						} else {
+							// Cache forever - serve directly
+							serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 							return nil
 						}
-						// Revalidation indicated we need to download
 					} else {
-						// Cache forever - serve directly
-						serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
-						return nil
+						// Database entry exists but file is missing - will re-download
+						vlog("cache entry exists but file missing: %s", storage_path)
 					}
 				}
+
+				// Compute storage path for new download
+				hashID := hash_path(request_path)
+				storage_path = get_storage_path(config.Data, hashID)
 
 				var download *Download
 				var ok bool
 
 				downloads_mu.Lock()
 
-				if r.Header.Get("Range") == "" && local_path != "" {
-					download, ok = downloads[local_path]
+				if r.Header.Get("Range") == "" {
+					download, ok = downloads[hashID]
 					if ok {
-						vlog("waiting on in-progress download: %s", local_path)
+						vlog("waiting on in-progress download: %s (id:%s)", request_path, hashID[:8])
 						fh, err := os.Open(download.tmp_path)
 						downloads_mu.Unlock()
 						if err != nil {
 							return err
 						}
-						return tmp_download(local_path, w, download, fh)
+						return tmp_download(storage_path, w, download, fh)
 					}
 				}
 
@@ -530,8 +476,8 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				if err != nil {
 					downloads_mu.Unlock()
 					// If we have a cached version, serve it despite the error
-					if local_path != "" {
-						if _, statErr := os.Stat(local_path); statErr == nil {
+					if _, _, cachedStoragePath, cachedErr := get_metadata(request_path); cachedErr == nil {
+						if _, statErr := os.Stat(cachedStoragePath); statErr == nil {
 							log.Printf("Remote error, serving from cache: %v", err)
 							fileserver.ServeHTTP(w, r)
 							return nil
@@ -554,10 +500,10 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					downloads_mu.Unlock()
 					vlog("upstream request failed: %v", err)
 					// If we have a cached version, serve it despite the error
-					if local_path != "" {
-						if cachedInfo, statErr := os.Stat(local_path); statErr == nil {
+					if _, _, cachedStoragePath, cachedErr := get_metadata(request_path); cachedErr == nil {
+						if cachedInfo, statErr := os.Stat(cachedStoragePath); statErr == nil {
 							log.Printf("Remote error, serving from cache: %v", err)
-							serve_cached_with_rewrite(w, r, local_path, cachedInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+							serve_cached_with_rewrite(w, r, request_path, cachedStoragePath, cachedInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 							return nil
 						}
 					}
@@ -583,11 +529,13 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					vlog("upstream returned %d for %s", resp.StatusCode, remote_url)
 					downloads_mu.Unlock()
 					// If we have a cached version and got 404/500/503, serve from cache
-					if local_path != "" && resp.StatusCode != 404 {
-						if cachedInfo, statErr := os.Stat(local_path); statErr == nil {
-							log.Printf("Remote returned %d, serving from cache", resp.StatusCode)
-							serve_cached_with_rewrite(w, r, local_path, cachedInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
-							return nil
+					if resp.StatusCode != 404 {
+						if _, _, cachedStoragePath, cachedErr := get_metadata(request_path); cachedErr == nil {
+							if cachedInfo, statErr := os.Stat(cachedStoragePath); statErr == nil {
+								log.Printf("Remote returned %d, serving from cache", resp.StatusCode)
+								serve_cached_with_rewrite(w, r, request_path, cachedStoragePath, cachedInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+								return nil
+							}
 						}
 					}
 					continue
@@ -609,8 +557,8 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 
 				// We don't want to cache the result if the server
 				// returns with a 206 Partial Content
-				if resp.StatusCode == 200 && local_path != "" {
-					vlog("downloading to cache: %s", local_path)
+				if resp.StatusCode == 200 {
+					vlog("downloading to cache: %s (id:%s)", request_path, hashID[:8])
 					tmp, err := ioutil.TempFile(config.Data, "remirror_tmp_")
 					if err != nil {
 						downloads_mu.Unlock()
@@ -632,7 +580,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 						tmp_path: tmp_path,
 						tmp_done: make(chan struct{}),
 					}
-					downloads[local_path] = download
+					downloads[hashID] = download
 				}
 				// release the mutex. if we have a successful download in
 				// progress, we have stored it correctly so far. if not,
@@ -659,7 +607,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					close(download.tmp_done)
 
 					downloads_mu.Lock()
-					delete(downloads, local_path)
+					delete(downloads, hashID)
 					downloads_mu.Unlock()
 				}()
 
@@ -703,7 +651,8 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				}
 
 				if tmp_path != "" {
-					os.MkdirAll(path.Dir(local_path), 0755)
+					// Create sharded directory structure for hash-based storage
+					os.MkdirAll(path.Dir(storage_path), 0755)
 
 					err = tmp_needs_final_close.Close()
 					if err != nil {
@@ -715,12 +664,12 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					if download != nil {
 						close(download.tmp_done)
 						downloads_mu.Lock()
-						delete(downloads, local_path)
+						delete(downloads, hashID)
 						downloads_mu.Unlock()
 						download = nil // so we don't re-close
 					}
 
-					err = os.Rename(tmp_path, local_path)
+					err = os.Rename(tmp_path, storage_path)
 					if err != nil {
 						log.Println(err)
 						return nil
@@ -730,15 +679,15 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					etag := resp.Header.Get("ETag")
 					lastModified := resp.Header.Get("Last-Modified")
 					if lastModified == "" {
-						if info, statErr := os.Stat(local_path); statErr == nil {
+						if info, statErr := os.Stat(storage_path); statErr == nil {
 							lastModified = info.ModTime().UTC().Format(http.TimeFormat)
 						}
 					}
 					if lastModified == "" {
 						lastModified = time.Now().UTC().Format(http.TimeFormat)
 					}
-					vlog("storing metadata for %s (etag=%q, last_modified=%q)", local_path, etag, lastModified)
-					if err := store_metadata(local_path, etag, lastModified); err != nil {
+					vlog("storing metadata for %s (id:%s, etag=%q, last_modified=%q)", request_path, hashID[:8], etag, lastModified)
+					if err := store_metadata(request_path, etag, lastModified); err != nil {
 						log.Printf("Warning: failed to store metadata: %v", err)
 					}
 
@@ -784,12 +733,12 @@ func load_configs(config *Config, configPath string) error {
 
 // revalidate_cache checks if the cached file is still valid using ETag or If-Modified-Since
 // Returns true if the request was handled (either 304 or served from cache)
-func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler, shouldRewrite bool, upstreamBase string, replacementURL string) bool {
+func revalidate_cache(w http.ResponseWriter, r *http.Request, request_path string, storage_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler, shouldRewrite bool, upstreamBase string, replacementURL string) bool {
 	// Don't revalidate on Range requests
 	if r.Header.Get("Range") != "" {
 		// For range requests on cached files, serve directly with cache metadata
-		touch_metadata(local_path)
-		etag, lastModified, _ := get_metadata(local_path)
+		touch_metadata(request_path)
+		etag, lastModified, _, _ := get_metadata(request_path)
 		if lastModified == "" {
 			lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
 		}
@@ -802,19 +751,19 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if err != nil {
 		// If we can't create the request, serve from cache
 		log.Printf("Error creating revalidation request, serving from cache: %v", err)
-		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+		serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
 	// Try to use ETag and Last-Modified if we have them stored
-	etag, lastModified, metaErr := get_metadata(local_path)
+	etag, lastModified, _, metaErr := get_metadata(request_path)
 	if metaErr == nil && etag != "" {
 		req.Header.Set("If-None-Match", etag)
-		vlog("revalidate ETag for %s: %s", local_path, etag)
+		vlog("revalidate ETag for %s: %s", request_path, etag)
 	} else if metaErr != nil {
-		vlog("revalidate metadata lookup failed for %s: %v", local_path, metaErr)
+		vlog("revalidate metadata lookup failed for %s: %v", request_path, metaErr)
 	} else {
-		vlog("no stored ETag for %s", local_path)
+		vlog("no stored ETag for %s", request_path)
 	}
 
 	// Add If-Modified-Since header as fallback
@@ -823,7 +772,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 		ims = fileInfo.ModTime().UTC().Format(http.TimeFormat)
 	}
 	req.Header.Set("If-Modified-Since", ims)
-	vlog("revalidate If-Modified-Since for %s: %s", local_path, ims)
+	vlog("revalidate If-Modified-Since for %s: %s", request_path, ims)
 	vlog_headers("revalidate request", req.Header)
 
 	// Copy original request headers (excluding Range for revalidation)
@@ -839,7 +788,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if err != nil {
 		// Network error, serve from cache
 		log.Printf("Remote unreachable during revalidation, serving from cache: %v", err)
-		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+		serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 	defer resp.Body.Close()
@@ -848,36 +797,36 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 
 	if resp.StatusCode == 304 {
 		// Not modified, serve from cache
-		log.Printf("Cache hit (304): %s", local_path)
-		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+		log.Printf("Cache hit (304): %s", request_path)
+		serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
 	if resp.StatusCode == 200 {
 		// File was modified, we need to update it
 		// Return false so the main handler downloads it
-		log.Printf("Cache stale (200): %s", local_path)
+		log.Printf("Cache stale (200): %s", request_path)
 		return false
 	}
 
 	if resp.StatusCode >= 500 {
 		// Server error, serve from cache
 		log.Printf("Remote error %d during revalidation, serving from cache", resp.StatusCode)
-		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+		serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
 	if resp.StatusCode == 404 {
 		// File no longer exists upstream, but we have it cached
 		// Serve from cache anyway
-		log.Printf("File not found upstream (404), serving from cache: %s", local_path)
-		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+		log.Printf("File not found upstream (404), serving from cache: %s", request_path)
+		serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
 	// For other status codes, serve from cache
 	log.Printf("Unexpected status %d during revalidation, serving from cache", resp.StatusCode)
-	serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
+	serve_cached_with_rewrite(w, r, request_path, storage_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 	return true
 }
 
@@ -1028,270 +977,6 @@ func override_mirror(dst *Mirror, src *Mirror) {
 	if len(src.Matches) > 0 {
 		dst.Matches = src.Matches
 	}
-}
-
-func split_csv(value string) []string {
-	if value == "" {
-		return nil
-	}
-	parts := strings.Split(value, ",")
-	items := make([]string, 0, len(parts))
-	for _, part := range parts {
-		item := strings.TrimSpace(part)
-		if item != "" {
-			items = append(items, item)
-		}
-	}
-	return items
-}
-
-func parse_matches(value string) ([]Match, error) {
-	if strings.TrimSpace(value) == "" {
-		return nil, nil
-	}
-	entries := strings.Split(value, ",")
-	matches := make([]Match, 0, len(entries))
-	for _, entry := range entries {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		parts := strings.Split(entry, ":")
-		if len(parts) < 1 || len(parts) > 2 {
-			return nil, fmt.Errorf("Invalid match entry %q (expected pattern[:action])", entry)
-		}
-		m := Match{
-			Pattern: parts[0],
-		}
-		if len(parts) == 2 {
-			action := parts[1]
-			if action != "cache" && action != "try" && action != "skip" {
-				return nil, fmt.Errorf("Invalid action %q in match entry (must be cache, try, or skip)", action)
-			}
-			m.Action = action
-		}
-		matches = append(matches, m)
-	}
-	return matches, nil
-}
-
-// init_metadata_db initializes the SQLite database for storing ETags
-func init_metadata_db(dataPath string) error {
-	dbPath := path.Join(dataPath, "metadata.db")
-
-	// Ensure the data directory exists
-	if err := os.MkdirAll(dataPath, 0755); err != nil {
-		return fmt.Errorf("failed to create data directory: %w", err)
-	}
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to open database: %w", err)
-	}
-
-	// Enable WAL mode for better concurrency
-	_, err = db.Exec("PRAGMA journal_mode=WAL")
-	if err != nil {
-		db.Close()
-		return fmt.Errorf("failed to enable WAL: %w", err)
-	}
-
-	// Create the metadata table
-	_, err = db.Exec(`
-		CREATE TABLE IF NOT EXISTS files (
-			path TEXT PRIMARY KEY,
-			etag TEXT NOT NULL,
-			last_modified DATETIME NOT NULL,
-			updated_at DATETIME NOT NULL
-		)
-	`)
-	if err != nil {
-		db.Close()
-		return fmt.Errorf("failed to create files table: %w", err)
-	}
-
-	metaDB = db
-	return nil
-}
-
-// normalize_path removes the cacheRoot prefix from a file path
-func normalize_path(filePath string) string {
-	if cacheRoot == "" {
-		return filePath
-	}
-	prefix := cacheRoot
-	if !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	if strings.HasPrefix(filePath, prefix) {
-		return strings.TrimPrefix(filePath, prefix)
-	}
-	return filePath
-}
-
-// store_metadata saves ETag and Last-Modified for a given file path
-func store_metadata(filePath, etag, lastModified string) error {
-	if metaDB == nil {
-		return fmt.Errorf("metadata database not initialized")
-	}
-
-	// Normalize the path to remove cacheRoot prefix
-	filePath = normalize_path(filePath)
-
-	// Avoid updating updated_at when metadata hasn't changed.
-	var existingEtag string
-	var existingLastModified string
-	err := metaDB.QueryRow(`SELECT etag, last_modified FROM files WHERE path = ?`, filePath).Scan(&existingEtag, &existingLastModified)
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-	if lastModified == "" {
-		lastModified = existingLastModified
-	}
-	if lastModified == "" {
-		lastModified = time.Now().UTC().Format(http.TimeFormat)
-	}
-	if err == nil && existingEtag == etag && existingLastModified == lastModified {
-		vlog("metadata unchanged for %s", filePath)
-		return nil
-	}
-
-	if err == nil {
-		vlog("metadata updated for %s: etag %q -> %q, last_modified %q -> %q", filePath, existingEtag, etag, existingLastModified, lastModified)
-	} else {
-		vlog("metadata inserted for %s: etag %q, last_modified %q", filePath, etag, lastModified)
-	}
-
-	_, err = metaDB.Exec(
-		`INSERT OR REPLACE INTO files (path, etag, last_modified, updated_at) VALUES (?, ?, ?, ?)`,
-		filePath, etag, lastModified, time.Now().UTC().Format(time.RFC3339),
-	)
-	return err
-}
-
-// get_metadata retrieves stored ETag and Last-Modified for a given file path
-func get_metadata(filePath string) (string, string, error) {
-	if metaDB == nil {
-		return "", "", fmt.Errorf("metadata database not initialized")
-	}
-
-	// Normalize the path to remove cacheRoot prefix
-	filePath = normalize_path(filePath)
-
-	var etag string
-	var lastModified string
-	err := metaDB.QueryRow(`SELECT etag, last_modified FROM files WHERE path = ?`, filePath).Scan(&etag, &lastModified)
-	if err == sql.ErrNoRows {
-		vlog("metadata not found for %s", filePath)
-		return "", "", nil // No metadata stored, not an error
-	}
-	if err == nil {
-		vlog("metadata loaded for %s: etag=%q last_modified=%q", filePath, etag, lastModified)
-	}
-	return etag, lastModified, err
-}
-
-// evict_old_files deletes cached files with updated_at older than the specified duration
-func evict_old_files(dataPath string, olderThanDuration time.Duration) error {
-	if metaDB == nil || olderThanDuration <= 0 {
-		return nil
-	}
-
-	cutoffTime := time.Now().Add(-olderThanDuration)
-	cutoffTimeStr := cutoffTime.UTC().Format(time.RFC3339)
-	var deletedCount int
-	var deletedSize int64
-
-	vlog("starting cache eviction for files with updated_at before %s", cutoffTimeStr)
-
-	// Query database for all files with updated_at < cutoffTime
-	rows, err := metaDB.Query(`SELECT path FROM files WHERE updated_at < ?`, cutoffTimeStr)
-	if err != nil {
-		return fmt.Errorf("failed to query eviction candidates: %w", err)
-	}
-	defer rows.Close()
-
-	var filesToEvict []string
-	for rows.Next() {
-		var relPath string
-		if err := rows.Scan(&relPath); err != nil {
-			return fmt.Errorf("failed to scan path: %w", err)
-		}
-		filesToEvict = append(filesToEvict, relPath)
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating eviction candidates: %w", err)
-	}
-
-	// Delete files and their database entries
-	for _, relPath := range filesToEvict {
-		fullPath := path.Join(dataPath, relPath)
-
-		// Get file size before deletion
-		fileSize := int64(0)
-		if info, statErr := os.Stat(fullPath); statErr == nil {
-			fileSize = info.Size()
-		}
-
-		// Delete file from filesystem
-		if err := os.Remove(fullPath); err != nil {
-			vlog("failed to delete file %s: %v", fullPath, err)
-			// Continue with other files even if one fails
-			continue
-		}
-
-		// Delete entry from database
-		if _, err := metaDB.Exec(`DELETE FROM files WHERE path = ?`, relPath); err != nil {
-			vlog("failed to delete database entry for %s: %v", relPath, err)
-		}
-
-		deletedCount++
-		deletedSize += fileSize
-		vlog("evicted file: %s (updated_at before %s)", relPath, cutoffTimeStr)
-	}
-
-	log.Printf("cache eviction complete: deleted %d files (%.2f MB)", deletedCount, float64(deletedSize)/1024/1024)
-	return nil
-}
-
-// start_eviction_scheduler starts a daily cache eviction task
-func start_eviction_scheduler(dataPath string, olderThanStr string) {
-	if strings.TrimSpace(olderThanStr) == "" {
-		vlog("cache eviction is disabled")
-		return
-	}
-
-	// Parse the duration
-	olderThan, err := time.ParseDuration(olderThanStr)
-	if err != nil {
-		log.Printf("Warning: invalid evict_older_than value %q: %v", olderThanStr, err)
-		return
-	}
-
-	if olderThan <= 0 {
-		log.Printf("Warning: evict_older_than must be positive, got %v", olderThan)
-		return
-	}
-
-	log.Printf("cache eviction enabled: deleting files older than %v", olderThan)
-
-	// Run eviction immediately
-	if err := evict_old_files(dataPath, olderThan); err != nil {
-		log.Printf("initial cache eviction failed: %v", err)
-	}
-
-	// Schedule daily eviction in a background goroutine
-	go func() {
-		ticker := time.NewTicker(24 * time.Hour)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			if err := evict_old_files(dataPath, olderThan); err != nil {
-				log.Printf("scheduled cache eviction failed: %v", err)
-			}
-		}
-	}()
 }
 
 func main() {

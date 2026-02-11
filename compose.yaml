@@ -10,7 +10,7 @@ services:
       - REMIRROR_HOST=http://localhost:8080
     develop:
       watch:
-        - path: main.go
+        - path: "*.go"
           action: rebuild
         - path: misc.go
           action: rebuild
