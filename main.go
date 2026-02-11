@@ -698,7 +698,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					}
 					vlog("storing metadata for %s (id:%s, etag=%q, last_modified=%q)", request_path, hashID[:8], etag, lastModified)
 					if err := store_metadata(request_path, etag, lastModified); err != nil {
-						log.Printf("Warning: failed to store metadata: %v", err)
+						log.Printf("Error: failed to store metadata: %v", err)
+						// Delete the file since it's not referenced in the database
+						if removeErr := os.Remove(storage_path); removeErr != nil {
+							log.Printf("Error: failed to remove orphaned file %s: %v", storage_path, removeErr)
+						} else {
+							log.Printf("Removed orphaned file %s", storage_path)
+						}
+						return nil
 					}
 
 					log.Println(">:)")
