@@ -57,12 +57,12 @@ type Mirror struct {
 
 type Match struct {
 	Pattern string // Regular expression pattern
-	Skip    bool   // skip = true means this is a "don't match" rule
+	Action  string // action = "cache" (default), "try" (cache with revalidation), or "skip" (don't cache)
 }
 
 type compiledMatch struct {
-	regex *regexp.Regexp
-	skip  bool
+	regex  *regexp.Regexp
+	action string
 }
 
 func (mirror Mirror) String() string {
@@ -84,8 +84,8 @@ func (mirror Mirror) String() string {
 	s += " "
 	for i, m := range mirror.Matches {
 		ss := m.Pattern
-		if m.Skip {
-			ss += " skip"
+		if m.Action != "" && m.Action != "cache" {
+			ss += " " + m.Action
 		}
 		if i+1 < len(mirror.Matches) {
 			ss += ", "
@@ -109,16 +109,64 @@ type Download struct {
 	tmp_done chan struct{} // will be closed when download is done and final bytes written
 }
 
-func (mirror Mirror) should_cache(path string) bool {
-	if len(mirror.compiledMatches) == 0 {
-		return false
-	}
+func (mirror Mirror) should_skip(path string) bool {
+	// Don't cache files matching action="skip" patterns
 	for _, cm := range mirror.compiledMatches {
-		if cm.regex.MatchString(path) {
-			return !cm.skip
+		if cm.regex.MatchString(path) && cm.action == "skip" {
+			return true
 		}
 	}
 	return false
+}
+
+func (mirror Mirror) should_revalidate(path string) bool {
+	// Revalidate files matching action="try" patterns
+	for _, cm := range mirror.compiledMatches {
+		if cm.regex.MatchString(path) && cm.action == "try" {
+			return true
+		}
+	}
+	return false
+}
+
+// proxy_request forwards a request directly to upstream without caching
+func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) error {
+	req, err := http.NewRequest("GET", remote_url, nil)
+	if err != nil {
+		return err
+	}
+
+	// Copy headers from original request
+	for k, vs := range r.Header {
+		if !hopHeaders[k] {
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
+	}
+
+	resp, err := http_client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for k, vs := range resp.Header {
+		if k == "Accept-Ranges" {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+
+	w.Header().Set("Server", "remirror")
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream response body
+	_, err = io.Copy(w, resp.Body)
+	return err
 }
 
 func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (http.Handler, error) {
@@ -165,11 +213,27 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					remote_url += path.Clean(upstream.Path + "/" + strings.TrimPrefix(r.URL.Path, mirror.Prefix))
 				}
 
-				if mirror.should_cache(remote_url) {
-					local_path = config.Data + path.Clean(r.URL.Path)
+				// Check if this should never be cached
+				if mirror.should_skip(remote_url) {
+					// Don't cache, proxy directly
+					proxy_request(w, r, remote_url)
+					return nil
+				}
 
-					_, err := os.Stat(local_path)
-					if err == nil {
+				local_path = config.Data + path.Clean(r.URL.Path)
+
+				// Check if we have a cached version
+				fileInfo, err := os.Stat(local_path)
+				if err == nil {
+					// We have a cached file
+					if mirror.should_revalidate(remote_url) {
+						// Revalidate files matching action="try" patterns
+						if revalidate_cache(w, r, local_path, fileInfo, remote_url, fileserver) {
+							return nil
+						}
+						// Revalidation indicated we need to download
+					} else {
+						// Cache forever - serve directly
 						fileserver.ServeHTTP(w, r)
 						return nil
 					}
@@ -204,6 +268,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				req, err := http.NewRequest("GET", remote_url, nil)
 				if err != nil {
 					downloads_mu.Unlock()
+					// If we have a cached version, serve it despite the error
+					if local_path != "" {
+						if _, statErr := os.Stat(local_path); statErr == nil {
+							log.Printf("Remote error, serving from cache: %v", err)
+							fileserver.ServeHTTP(w, r)
+							return nil
+						}
+					}
 					return err
 				}
 
@@ -218,6 +290,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				resp, err := http_client.Do(req)
 				if err != nil {
 					downloads_mu.Unlock()
+					// If we have a cached version, serve it despite the error
+					if local_path != "" {
+						if _, statErr := os.Stat(local_path); statErr == nil {
+							log.Printf("Remote error, serving from cache: %v", err)
+							fileserver.ServeHTTP(w, r)
+							return nil
+						}
+					}
 					return err
 				}
 				defer resp.Body.Close()
@@ -227,6 +307,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					resp.StatusCode == 500 ||
 					resp.StatusCode == 503 {
 					downloads_mu.Unlock()
+					// If we have a cached version and got 404/500/503, serve from cache
+					if local_path != "" && resp.StatusCode != 404 {
+						if _, statErr := os.Stat(local_path); statErr == nil {
+							log.Printf("Remote returned %d, serving from cache", resp.StatusCode)
+							fileserver.ServeHTTP(w, r)
+							return nil
+						}
+					}
 					continue
 				}
 
@@ -370,6 +458,79 @@ func load_configs(config *Config, configPath string) error {
 	return nil
 }
 
+// revalidate_cache checks if the cached file is still valid using If-Modified-Since
+// Returns true if the request was handled (either 304 or served from cache)
+func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler) bool {
+	// Don't revalidate on Range requests
+	if r.Header.Get("Range") != "" {
+		fileserver.ServeHTTP(w, r)
+		return true
+	}
+
+	req, err := http.NewRequest("GET", remote_url, nil)
+	if err != nil {
+		// If we can't create the request, serve from cache
+		log.Printf("Error creating revalidation request, serving from cache: %v", err)
+		fileserver.ServeHTTP(w, r)
+		return true
+	}
+
+	// Add If-Modified-Since header
+	req.Header.Set("If-Modified-Since", fileInfo.ModTime().UTC().Format(http.TimeFormat))
+
+	// Copy original request headers
+	for k, vs := range r.Header {
+		if !hopHeaders[k] {
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
+	}
+
+	resp, err := http_client.Do(req)
+	if err != nil {
+		// Network error, serve from cache
+		log.Printf("Remote unreachable during revalidation, serving from cache: %v", err)
+		fileserver.ServeHTTP(w, r)
+		return true
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 304 {
+		// Not modified, serve from cache
+		log.Printf("Cache hit (304): %s", local_path)
+		fileserver.ServeHTTP(w, r)
+		return true
+	}
+
+	if resp.StatusCode == 200 {
+		// File was modified, we need to update it
+		// Return false so the main handler downloads it
+		log.Printf("Cache stale (200): %s", local_path)
+		return false
+	}
+
+	if resp.StatusCode >= 500 {
+		// Server error, serve from cache
+		log.Printf("Remote error %d during revalidation, serving from cache", resp.StatusCode)
+		fileserver.ServeHTTP(w, r)
+		return true
+	}
+
+	if resp.StatusCode == 404 {
+		// File no longer exists upstream, but we have it cached
+		// Serve from cache anyway
+		log.Printf("File not found upstream (404), serving from cache: %s", local_path)
+		fileserver.ServeHTTP(w, r)
+		return true
+	}
+
+	// For other status codes, serve from cache
+	log.Printf("Unexpected status %d during revalidation, serving from cache", resp.StatusCode)
+	fileserver.ServeHTTP(w, r)
+	return true
+}
+
 func compile_mirror_matches(mirror *Mirror) error {
 	mirror.compiledMatches = make([]*compiledMatch, 0, len(mirror.Matches))
 	for i, m := range mirror.Matches {
@@ -380,9 +541,16 @@ func compile_mirror_matches(mirror *Mirror) error {
 		if err != nil {
 			return fmt.Errorf("Match rule %d pattern %q: %w", i, m.Pattern, err)
 		}
+		action := m.Action
+		if action == "" {
+			action = "cache" // default action
+		}
+		if action != "cache" && action != "try" && action != "skip" {
+			return fmt.Errorf("Match rule %d has invalid action %q (must be cache, try, or skip)", i, action)
+		}
 		mirror.compiledMatches = append(mirror.compiledMatches, &compiledMatch{
-			regex: re,
-			skip:  m.Skip,
+			regex:  re,
+			action: action,
 		})
 	}
 	return nil
@@ -530,13 +698,17 @@ func parse_matches(value string) ([]Match, error) {
 		}
 		parts := strings.Split(entry, ":")
 		if len(parts) < 1 || len(parts) > 2 {
-			return nil, fmt.Errorf("Invalid match entry %q (expected pattern[:skip])", entry)
+			return nil, fmt.Errorf("Invalid match entry %q (expected pattern[:action])", entry)
 		}
 		m := Match{
 			Pattern: parts[0],
 		}
 		if len(parts) == 2 {
-			m.Skip = parts[1] == "true" || parts[1] == "1"
+			action := parts[1]
+			if action != "cache" && action != "try" && action != "skip" {
+				return nil, fmt.Errorf("Invalid action %q in match entry (must be cache, try, or skip)", action)
+			}
+			m.Action = action
 		}
 		matches = append(matches, m)
 	}

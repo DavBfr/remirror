@@ -6,11 +6,8 @@ mirrors {
 		prefix = "/archlinux/"
 		upstream = "https://mirrors.xmission.com"
 		matches {
-			match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-			match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-			match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-			match { pattern = "-rpm\\.bin$" }
-			match { pattern = "\\.xz\\.sig$" }
+			match { pattern = "\\.(db|files|db\\.sig|files\\.sig)(\\.tar\\.(gz|xz|zst))?$" action = "try" }
+			match { pattern = "/.*\\.links\\.tar\\.gz$" action = "try" }
 		}
 	}
 
@@ -18,11 +15,8 @@ mirrors {
 		prefix = "/centos/"
 		upstream = "https://mirrors.xmission.com"
 		matches {
-			match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-			match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-			match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-			match { pattern = "-rpm\\.bin$" }
-			match { pattern = "\\.xz\\.sig$" }
+			match { pattern = "/repodata/.*\\.(xml|sqlite)(\\.gz|\\.bz2|\\.xz)?$" action = "try" }
+			match { pattern = "/(repomd\\.xml|TRANS\\.TBL)$" action = "try" }
 		}
 	}
 
@@ -30,11 +24,8 @@ mirrors {
 		prefix = "/fedora/"
 		upstream = "https://mirrors.xmission.com"
 		matches {
-			match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-			match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-			match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-			match { pattern = "-rpm\\.bin$" }
-			match { pattern = "\\.xz\\.sig$" }
+			match { pattern = "/repodata/.*\\.(xml|sqlite)(\\.gz|\\.bz2|\\.xz)?$" action = "try" }
+			match { pattern = "/(repomd\\.xml|TRANS\\.TBL)$" action = "try" }
 		}
 	}
 
@@ -42,11 +33,8 @@ mirrors {
 		prefix = "/fedora-epel/"
 		upstream = "https://mirrors.xmission.com"
 		matches {
-			match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-			match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-			match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-			match { pattern = "-rpm\\.bin$" }
-			match { pattern = "\\.xz\\.sig$" }
+			match { pattern = "/repodata/.*\\.(xml|sqlite)(\\.gz|\\.bz2|\\.xz)?$" action = "try" }
+			match { pattern = "/(repomd\\.xml|TRANS\\.TBL)$" action = "try" }
 		}
 	}
 
@@ -54,23 +42,13 @@ mirrors {
 		prefix = "/ubuntu/"
 		upstream = "https://mirrors.xmission.com"
 		matches {
-			match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-			match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-			match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-			match { pattern = "-rpm\\.bin$" }
-			match { pattern = "\\.xz\\.sig$" }
+			match { pattern = "/(Packages|Sources|Contents-.*|Release|InRelease)(\\.gz|\\.bz2|\\.xz)?$" action = "try" }
+			match { pattern = "/by-hash/.*$" action = "try" }
 		}
 	}
 
 	mirror {
 		prefix = "/golang/"
 		upstream = "https://storage.googleapis.com"
-		matches {
-			match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-			match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-			match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-			match { pattern = "-rpm\\.bin$" }
-			match { pattern = "\\.xz\\.sig$" }
-		}
 	}
 }

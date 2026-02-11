@@ -6,6 +6,8 @@ Caching HTTP proxy for distro and toolchain mirrors. It sits in front of one or 
 
 - Prefix-based routing to upstream mirrors or local directories.
 - On-disk cache with concurrent download fanout (multiple clients can read a single in-progress download).
+- Automatic cache validation using `If-Modified-Since` headers.
+- Resilient operation: serves from cache when upstream is unavailable.
 - HCL configuration with env overrides.
 - Multiple upstreams per mirror with basic failover on 404/500/503.
 
@@ -38,10 +40,8 @@ mirrors {
         prefix = "/archlinux/"
         upstream = "https://mirrors.xmission.com"
         matches {
-            match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
-            match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
-            match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
-            match { pattern = "-rpm\\.bin$" }
+            match { pattern = "/(Packages|Sources)\\.gz$" action = "try" }
+            match { pattern = "\\.(db|files|links)\\.tar\\.gz$" action = "try" }
         }
     }
 
@@ -79,12 +79,15 @@ Each `mirror` supports:
 - `upstream`: single upstream base URL.
 - `upstreams`: multiple upstream base URLs (used in order).
 - `local`: local directory served instead of an upstream.
-- `matches`: list of match rules that control caching behavior.
+- `matches`: optional list of match rules to control cache behavior.
 
-Match rules are evaluated in order and the first matching rule wins:
+Match rules control caching behavior with three possible actions:
 
 - `pattern`: Regular expression pattern to match against the request path.
-- `skip`: when `true`, matching paths are not cached.
+- `action`: Cache behavior for matching paths:
+  - `"cache"` (default): Cache forever without validation
+  - `"try"`: Cache but validate with `If-Modified-Since` on every request
+  - `"skip"`: Never cache, always proxy directly from upstream
 
 ### Environment overrides
 
@@ -103,7 +106,7 @@ Supported fields:
 - `UPSTREAM`
 - `UPSTREAMS` (comma-separated list)
 - `LOCAL`
-- `MATCHES` (comma-separated list of `pattern[:skip]` entries)
+- `MATCHES` (comma-separated list of `pattern[:action]` entries, where action is `cache`, `try`, or `skip`)
 
 Example:
 
@@ -112,21 +115,31 @@ export REMIRROR_LISTEN=":8080"
 export REMIRROR_DATA="/var/remirror"
 export REMIRROR_MIRRORS_ARCH_PREFIX="/archlinux/"
 export REMIRROR_MIRRORS_ARCH_UPSTREAMS="https://mirror1.example.com,https://mirror2.example.com"
-export REMIRROR_MIRRORS_ARCH_MATCHES='\\.pkg\\.tar\\.zst$,\\.sig$'
+export REMIRROR_MIRRORS_ARCH_MATCHES='\\.pkg\\.tar\\.zst$:cache,\\.sig$:try'
 ```
 
 ## Cache behavior
 
-Caching is driven entirely by `matches` regular expressions. If a mirror has no match rules, nothing is cached for that mirror. Rules are evaluated in order and the first matching rule wins.
+Caching behavior is controlled by match rules with three actions:
 
-The default [remirror.hcl](remirror.hcl) includes patterns that:
-- Skip repo metadata (such as `*/Packages.gz` and `*.db.tar.gz`).
-- Cache common archive and package formats (`.xz`, `.rpm`, `.deb`, etc).
+- **`action = "cache"` (default)**: Files are cached forever once downloaded. Subsequent requests are served directly from cache without contacting upstream.
+
+- **`action = "try"`**: Files are cached but validated with `If-Modified-Since` on every request. If upstream returns `304 Not Modified`, the cached version is served. If upstream is unreachable, the cache is still served.
+
+- **`action = "skip"`**: Files are never cached. Every request is proxied directly to upstream without storing on disk.
+
+This allows package archives and immutable content to be cached permanently (action="cache"), while repo metadata (like `Packages.gz`) stays fresh (action="try"), and sensitive or dynamic content is never stored (action="skip").
+
+The default [remirror.hcl](remirror.hcl) includes `action = "try"` patterns for repo metadata that should always be validated.
 
 ## Notes
 
-- Range requests are proxied but are not cached.
-- Failed upstream responses with 404/500/503 are retried against the next upstream in the list.
+- Files without matching rules default to `action = "cache"` (cached forever).
+- Files with `action = "try"` are cached but validated with `If-Modified-Since` on every request.
+- Files with `action = "skip"` are never cached and always proxied to upstream.
+- When upstream mirrors are unreachable or return errors, cached versions are served automatically (for "cache" and "try" actions).
+- Range requests are served directly from cache without revalidation.
+- Failed upstream responses with 404/500/503 fall back to cache if available, or retry the next upstream.
 
 ## Docker
 
