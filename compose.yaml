@@ -7,6 +7,7 @@ services:
       - ./data:/var/remirror
     environment:
       - REMIRROR_EVICT_OLDER_THAN=2880h
+      - REMIRROR_HOST=http://localhost:8080
     develop:
       watch:
         - path: main.go

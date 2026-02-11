@@ -1,4 +1,4 @@
-module github.com/yobert/remirror
+module remirror
 
 go 1.25
 

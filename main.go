@@ -31,6 +31,7 @@ var excludeHeadersUpstream = map[string]bool{
 type Config struct {
 	Listen          string   `hcl:"listen"`
 	Data            string   `hcl:"data"`
+	Host            string   `hcl:"host"`
 	EvictOlderThan  string   `hcl:"evict_older_than"`
 	UpstreamTimeout string   `hcl:"upstream_timeout"`
 	Mirrors         []Mirror `hcl:"mirrors"`
@@ -72,11 +73,13 @@ type Mirror struct {
 type Match struct {
 	Pattern string `hcl:"pattern"`
 	Action  string `hcl:"action"`
+	Rewrite bool   `hcl:"rewrite"`
 }
 
 type compiledMatch struct {
-	regex  *regexp.Regexp
-	action string
+	regex   *regexp.Regexp
+	action  string
+	rewrite bool
 }
 
 func (mirror Mirror) String() string {
@@ -261,6 +264,34 @@ func serve_cached(w http.ResponseWriter, r *http.Request, local_path string, fil
 	fileserver.ServeHTTP(w, r)
 }
 
+// serve_cached_with_rewrite serves cached content with URL rewriting if needed
+func serve_cached_with_rewrite(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, fileserver http.Handler, shouldRewrite bool, upstreamURL string, replacementURL string) {
+	if !shouldRewrite {
+		serve_cached(w, r, local_path, fileInfo, fileserver)
+		return
+	}
+
+	if handle_client_conditionals(w, r, local_path, fileInfo) {
+		return
+	}
+	touch_metadata(local_path)
+	etag, lastModified, _ := get_metadata(local_path)
+	if lastModified == "" {
+		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
+	}
+	set_cache_metadata_headers(w, etag, lastModified)
+
+	// Read file, rewrite, and serve
+	content, err := ioutil.ReadFile(local_path)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	rewritten := rewriteContent(content, upstreamURL, replacementURL)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(rewritten)))
+	w.Write(rewritten)
+}
+
 type Download struct {
 	resp *http.Response
 
@@ -284,6 +315,17 @@ func (mirror Mirror) should_revalidate(path string) bool {
 	for _, cm := range mirror.compiledMatches {
 		if cm.regex.MatchString(path) && cm.action == "try" {
 			vlog("try action matched for %s", path)
+			return true
+		}
+	}
+	return false
+}
+
+func (mirror Mirror) should_rewrite(path string) bool {
+	// Check if content should be rewritten
+	for _, cm := range mirror.compiledMatches {
+		if cm.regex.MatchString(path) && cm.rewrite {
+			vlog("rewrite matched for %s", path)
 			return true
 		}
 	}
@@ -340,6 +382,24 @@ func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) er
 	// Stream response body
 	_, err = io.Copy(w, decompressed)
 	return err
+}
+
+// rewriteContent replaces upstream URLs with local mirror URLs in the content
+func rewriteContent(content []byte, upstreamURL, replacementURL string) []byte {
+	// Parse the upstream URL to get the base (without path)
+	if u, err := url.Parse(upstreamURL); err == nil {
+		upstreamBase := u.Scheme + "://" + u.Host
+		if u.Path != "" && u.Path != "/" {
+			upstreamBase += u.Path
+		}
+		// Remove trailing slash for consistent matching
+		upstreamBase = strings.TrimSuffix(upstreamBase, "/")
+		replacementURL = strings.TrimSuffix(replacementURL, "/")
+
+		vlog("rewriting %s -> %s", upstreamBase, replacementURL)
+		return []byte(strings.ReplaceAll(string(content), upstreamBase, replacementURL))
+	}
+	return content
 }
 
 func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (http.Handler, error) {
@@ -399,6 +459,17 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 
 				vlog("resolved upstream url: %s", remote_url)
 
+				// Check if content rewriting is needed
+				shouldRewrite := mirror.should_rewrite(remote_url)
+				upstreamBase := upstream.Scheme + "://" + upstream.Host
+				if upstream.Path != "" && upstream.Path != "/" {
+					upstreamBase += upstream.Path
+				}
+				replacementURL := config.Host + mirror.Prefix
+				if shouldRewrite {
+					vlog("rewrite enabled: %s -> %s", upstreamBase, replacementURL)
+				}
+
 				// Check if this should never be cached
 				if mirror.should_skip(remote_url) {
 					// Don't cache, proxy directly
@@ -417,13 +488,13 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					// We have a cached file
 					if mirror.should_revalidate(remote_url) {
 						// Revalidate files matching action="try" patterns
-						if revalidate_cache(w, r, local_path, fileInfo, remote_url, fileserver) {
+						if revalidate_cache(w, r, local_path, fileInfo, remote_url, fileserver, shouldRewrite, upstreamBase, replacementURL) {
 							return nil
 						}
 						// Revalidation indicated we need to download
 					} else {
 						// Cache forever - serve directly
-						serve_cached(w, r, local_path, fileInfo, fileserver)
+						serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 						return nil
 					}
 				}
@@ -486,7 +557,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					if local_path != "" {
 						if cachedInfo, statErr := os.Stat(local_path); statErr == nil {
 							log.Printf("Remote error, serving from cache: %v", err)
-							serve_cached(w, r, local_path, cachedInfo, fileserver)
+							serve_cached_with_rewrite(w, r, local_path, cachedInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 							return nil
 						}
 					}
@@ -515,7 +586,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					if local_path != "" && resp.StatusCode != 404 {
 						if cachedInfo, statErr := os.Stat(local_path); statErr == nil {
 							log.Printf("Remote returned %d, serving from cache", resp.StatusCode)
-							serve_cached(w, r, local_path, cachedInfo, fileserver)
+							serve_cached_with_rewrite(w, r, local_path, cachedInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 							return nil
 						}
 					}
@@ -594,10 +665,33 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 
 				write_resp_headers(w, resp)
 
-				n, err := io.Copy(out, decompressedBody)
-				if err != nil {
-					log.Println(err)
-					return nil
+				var n int64
+				if shouldRewrite {
+					// For rewrite, we need to load entire content into memory
+					content, err := ioutil.ReadAll(decompressedBody)
+					if err != nil {
+						log.Println(err)
+						return nil
+					}
+
+					// Apply rewrite
+					rewritten := rewriteContent(content, upstreamBase, replacementURL)
+					n = int64(len(rewritten))
+
+					// Write to both cache and client
+					_, err = out.Write(rewritten)
+					if err != nil {
+						log.Println(err)
+						return nil
+					}
+				} else {
+					// Normal streaming without rewrite
+					var err error
+					n, err = io.Copy(out, decompressedBody)
+					if err != nil {
+						log.Println(err)
+						return nil
+					}
 				}
 
 				if n != resp.ContentLength && resp.ContentLength != -1 {
@@ -690,7 +784,7 @@ func load_configs(config *Config, configPath string) error {
 
 // revalidate_cache checks if the cached file is still valid using ETag or If-Modified-Since
 // Returns true if the request was handled (either 304 or served from cache)
-func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler) bool {
+func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler, shouldRewrite bool, upstreamBase string, replacementURL string) bool {
 	// Don't revalidate on Range requests
 	if r.Header.Get("Range") != "" {
 		// For range requests on cached files, serve directly with cache metadata
@@ -708,7 +802,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if err != nil {
 		// If we can't create the request, serve from cache
 		log.Printf("Error creating revalidation request, serving from cache: %v", err)
-		serve_cached(w, r, local_path, fileInfo, fileserver)
+		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
@@ -745,7 +839,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if err != nil {
 		// Network error, serve from cache
 		log.Printf("Remote unreachable during revalidation, serving from cache: %v", err)
-		serve_cached(w, r, local_path, fileInfo, fileserver)
+		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 	defer resp.Body.Close()
@@ -755,7 +849,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if resp.StatusCode == 304 {
 		// Not modified, serve from cache
 		log.Printf("Cache hit (304): %s", local_path)
-		serve_cached(w, r, local_path, fileInfo, fileserver)
+		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
@@ -769,7 +863,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if resp.StatusCode >= 500 {
 		// Server error, serve from cache
 		log.Printf("Remote error %d during revalidation, serving from cache", resp.StatusCode)
-		serve_cached(w, r, local_path, fileInfo, fileserver)
+		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
@@ -777,13 +871,13 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 		// File no longer exists upstream, but we have it cached
 		// Serve from cache anyway
 		log.Printf("File not found upstream (404), serving from cache: %s", local_path)
-		serve_cached(w, r, local_path, fileInfo, fileserver)
+		serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 		return true
 	}
 
 	// For other status codes, serve from cache
 	log.Printf("Unexpected status %d during revalidation, serving from cache", resp.StatusCode)
-	serve_cached(w, r, local_path, fileInfo, fileserver)
+	serve_cached_with_rewrite(w, r, local_path, fileInfo, fileserver, shouldRewrite, upstreamBase, replacementURL)
 	return true
 }
 
@@ -805,8 +899,9 @@ func compile_mirror_matches(mirror *Mirror) error {
 			return fmt.Errorf("Match rule %d has invalid action %q (must be cache, try, or skip)", i, action)
 		}
 		mirror.compiledMatches = append(mirror.compiledMatches, &compiledMatch{
-			regex:  re,
-			action: action,
+			regex:   re,
+			action:  action,
+			rewrite: m.Rewrite,
 		})
 	}
 	return nil
@@ -818,6 +913,9 @@ func apply_env_overrides(config *Config) error {
 	}
 	if v := strings.TrimSpace(os.Getenv("REMIRROR_DATA")); v != "" {
 		config.Data = v
+	}
+	if v := strings.TrimSpace(os.Getenv("REMIRROR_HOST")); v != "" {
+		config.Host = v
 	}
 	if v := strings.TrimSpace(os.Getenv("REMIRROR_EVICT_OLDER_THAN")); v != "" {
 		config.EvictOlderThan = v

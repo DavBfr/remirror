@@ -1,6 +1,7 @@
 listen = ":8080"
 data = "/var/remirror"
-upstream_timeout = "2000ms"
+host = "http://localhost:8080"
+upstream_timeout = "30s"
 
 mirrors {
 	mirror {
@@ -84,6 +85,7 @@ mirrors {
 		matches {
 			match { pattern = "/.*\\.tgz$" action = "cache" }
 			match { pattern = "/-/.*" action = "try" }
+			match { pattern = "/[^/]+$" action = "try" rewrite = true }
 		}
 	}
 
