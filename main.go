@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,10 +29,11 @@ var excludeHeadersUpstream = map[string]bool{
 }
 
 type Config struct {
-	Listen         string   `hcl:"listen"`
-	Data           string   `hcl:"data"`
-	EvictOlderThan string   `hcl:"evict_older_than"`
-	Mirrors        []Mirror `hcl:"mirrors"`
+	Listen          string   `hcl:"listen"`
+	Data            string   `hcl:"data"`
+	EvictOlderThan  string   `hcl:"evict_older_than"`
+	UpstreamTimeout string   `hcl:"upstream_timeout"`
+	Mirrors         []Mirror `hcl:"mirrors"`
 }
 type Mirror struct {
 	// Prefix specifies a path that should be sent
@@ -488,7 +490,16 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 							return nil
 						}
 					}
-					return err
+
+					// Check if it's a timeout error
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						vlog("upstream request timed out")
+						return HTTPError(504)
+					}
+
+					// Any other network error without cache = 503 Service Unavailable
+					vlog("upstream request error without cache: %v", err)
+					return HTTPError(503)
 				}
 				defer resp.Body.Close()
 				vlog("upstream response %d for %s", resp.StatusCode, remote_url)
@@ -811,6 +822,9 @@ func apply_env_overrides(config *Config) error {
 	if v := strings.TrimSpace(os.Getenv("REMIRROR_EVICT_OLDER_THAN")); v != "" {
 		config.EvictOlderThan = v
 	}
+	if v := strings.TrimSpace(os.Getenv("REMIRROR_UPSTREAM_TIMEOUT")); v != "" {
+		config.UpstreamTimeout = v
+	}
 
 	mirrorsByName := map[string]*Mirror{}
 
@@ -975,6 +989,13 @@ func init_metadata_db(dataPath string) error {
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Enable WAL mode for better concurrency
+	_, err = db.Exec("PRAGMA journal_mode=WAL")
+	if err != nil {
+		db.Close()
+		return fmt.Errorf("failed to enable WAL: %w", err)
 	}
 
 	// Create the metadata table
@@ -1194,6 +1215,18 @@ func main() {
 		log.Fatalf("Env override error: %v", err)
 	}
 	cacheRoot = config.Data
+
+	// Initialize HTTP client with upstream timeout
+	timeoutDuration := 30 * time.Second // default timeout
+	if config.UpstreamTimeout != "" {
+		parsed, err := time.ParseDuration(config.UpstreamTimeout)
+		if err != nil {
+			log.Fatalf("Invalid upstream_timeout value: %v", err)
+		}
+		timeoutDuration = parsed
+	}
+	http_client.Timeout = timeoutDuration
+	vlog("upstream timeout set to %v", timeoutDuration)
 
 	// Initialize metadata database for ETag storage
 	if err := init_metadata_db(config.Data); err != nil {

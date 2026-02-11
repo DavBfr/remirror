@@ -1,5 +1,6 @@
 listen = ":8080"
 data = "/var/remirror"
+upstream_timeout = "2000ms"
 
 mirrors {
 	mirror {
