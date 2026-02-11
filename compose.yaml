@@ -1,0 +1,22 @@
+services:
+  remirror:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - remirror-data:/var/remirror
+    develop:
+      watch:
+        - path: /*.go
+          action: rebuild
+        - path: ./go.mod
+          action: rebuild
+        - path: ./go.sum
+          action: rebuild
+        - path: ./Dockerfile
+          action: rebuild
+        - path: ./remirror.hcl
+          action: rebuild
+
+volumes:
+  remirror-data: {}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -9,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +22,7 @@ import (
 const VERSION = "0.0.6"
 
 type Config struct {
-	Listen  string // HTTP listen address. ":8084"
+	Listen  string // HTTP listen address. ":8080"
 	Data    string // Storage location for cached files. "/var/remirror"
 	Mirrors []Mirror
 }
@@ -370,45 +373,192 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 	}), nil
 }
 
-func load_configs(config *Config) error {
-	try := []string{"remirror.hcl"}
-	home := os.Getenv("HOME")
-	if home != "" {
-		try = append(try, home+"/.remirror.hcl")
+func load_configs(config *Config, configPath string) error {
+	log.Printf("Loading configuration from %#v ...\n", configPath)
+	configBytes, err := ioutil.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("Config error: unable to read %s: %w", configPath, err)
 	}
-	try = append(try, "/etc/remirror.hcl")
+	if err := hcl.Unmarshal(configBytes, config); err != nil {
+		return err
+	}
+	return nil
+}
 
-	for _, t := range try {
-		_, err := os.Stat(t)
-		if err == nil {
-			log.Printf("Loading configuration from %#v ...\n", t)
-			config_bytes, err := ioutil.ReadFile(t)
+func apply_env_overrides(config *Config) error {
+	if v := strings.TrimSpace(os.Getenv("REMIRROR_LISTEN")); v != "" {
+		config.Listen = v
+	}
+	if v := strings.TrimSpace(os.Getenv("REMIRROR_DATA")); v != "" {
+		config.Data = v
+	}
+
+	mirrorsByName := map[string]*Mirror{}
+
+	for _, env := range os.Environ() {
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := parts[0]
+		val := strings.TrimSpace(parts[1])
+		const prefix = "REMIRROR_MIRRORS_"
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(key, prefix)
+		nameField := strings.SplitN(rest, "_", 2)
+		if len(nameField) != 2 {
+			continue
+		}
+		name := nameField[0]
+		field := nameField[1]
+		if name == "" || field == "" {
+			continue
+		}
+
+		mirror := mirrorsByName[name]
+		if mirror == nil {
+			mirror = &Mirror{}
+			mirrorsByName[name] = mirror
+		}
+
+		switch field {
+		case "PREFIX":
+			mirror.Prefix = val
+		case "UPSTREAM":
+			mirror.Upstream = val
+		case "UPSTREAMS":
+			mirror.Upstreams = split_csv(val)
+		case "LOCAL":
+			mirror.Local = val
+		case "MATCHES":
+			matches, err := parse_matches(val)
 			if err != nil {
 				return err
 			}
-			if err := hcl.Unmarshal(config_bytes, config); err != nil {
-				return err
-			}
-			return nil
+			mirror.Matches = matches
+		default:
+			log.Printf("Ignoring unknown env field %s for mirror %s", field, name)
 		}
 	}
-	return fmt.Errorf("No files found: Create one of %s", strings.Join(try, ", "))
+
+	if len(mirrorsByName) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(mirrorsByName))
+	for name := range mirrorsByName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		src := mirrorsByName[name]
+		if src.Prefix == "" {
+			log.Printf("Skipping mirror %s: PREFIX is required", name)
+			continue
+		}
+		applied := false
+		for i := range config.Mirrors {
+			if config.Mirrors[i].Prefix == src.Prefix {
+				override_mirror(&config.Mirrors[i], src)
+				applied = true
+				break
+			}
+		}
+		if !applied {
+			config.Mirrors = append(config.Mirrors, *src)
+		}
+	}
+
+	return nil
+}
+
+func override_mirror(dst *Mirror, src *Mirror) {
+	if src.Prefix != "" {
+		dst.Prefix = src.Prefix
+	}
+	if src.Upstream != "" {
+		dst.Upstream = src.Upstream
+	}
+	if len(src.Upstreams) > 0 {
+		dst.Upstreams = src.Upstreams
+	}
+	if src.Local != "" {
+		dst.Local = src.Local
+	}
+	if len(src.Matches) > 0 {
+		dst.Matches = src.Matches
+	}
+}
+
+func split_csv(value string) []string {
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	items := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func parse_matches(value string) ([]Match, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	entries := strings.Split(value, ",")
+	matches := make([]Match, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		parts := strings.Split(entry, ":")
+		if len(parts) < 2 || len(parts) > 3 {
+			return nil, fmt.Errorf("Invalid match entry %q (expected prefix:suffix[:skip])", entry)
+		}
+		m := Match{
+			Prefix: parts[0],
+			Suffix: parts[1],
+		}
+		if len(parts) == 3 {
+			b, err := strconv.ParseBool(parts[2])
+			if err != nil {
+				return nil, fmt.Errorf("Invalid match skip value %q in %q", parts[2], entry)
+			}
+			m.Skip = b
+		}
+		matches = append(matches, m)
+	}
+	return matches, nil
 }
 
 func main() {
-	for _, arg := range os.Args[1:] {
-		if arg == "--version" {
-			fmt.Println("remirror", VERSION)
-			os.Exit(0)
-		}
-		fmt.Println("Unhandled argument", arg)
-		os.Exit(1)
+	configPath := flag.String("config", "remirror.hcl", "Path to config file")
+	version := flag.Bool("version", false, "Print version and exit")
+	flag.Parse()
+
+	if *version {
+		fmt.Println("remirror", VERSION)
+		os.Exit(0)
+	}
+	if flag.NArg() > 0 {
+		log.Fatalf("Unhandled arguments: %v", flag.Args())
 	}
 
 	config := &Config{}
 
-	if err := load_configs(config); err != nil {
+	if err := load_configs(config, *configPath); err != nil {
 		log.Fatalf("Config error: %v", err)
+	}
+	if err := apply_env_overrides(config); err != nil {
+		log.Fatalf("Env override error: %v", err)
 	}
 
 	fileserver := http.FileServer(http.Dir(config.Data))

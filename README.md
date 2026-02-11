@@ -6,7 +6,7 @@ Caching HTTP proxy for distro and toolchain mirrors. It sits in front of one or 
 
 - Prefix-based routing to upstream mirrors or local directories.
 - On-disk cache with concurrent download fanout (multiple clients can read a single in-progress download).
-- Simple HCL configuration.
+- HCL configuration with env overrides.
 - Multiple upstreams per mirror with basic failover on 404/500/503.
 
 ## Build and run
@@ -21,19 +21,16 @@ go build .
 Flags:
 
 - `--version` prints the current version and exits.
+- `-config` sets the config file path (defaults to `remirror.hcl`).
 
 ## Configuration
 
-The server loads the first config file found in this order:
-
-1. `./remirror.hcl`
-2. `$HOME/.remirror.hcl`
-3. `/etc/remirror.hcl`
+By default the server loads `remirror.hcl` from the current working directory. You can override the path with `-config`.
 
 Example configuration:
 
 ```hcl
-listen = ":8084"
+listen = ":8080"
 data = "/var/remirror"
 
 mirrors {
@@ -66,7 +63,7 @@ mirrors {
 
 ### Config fields
 
-- `listen`: HTTP bind address, e.g. `":8084"`.
+- `listen`: HTTP bind address, e.g. `":8080"`.
 - `data`: on-disk cache root, e.g. `"/var/remirror"`.
 - `mirrors`: list of `mirror` blocks.
 
@@ -83,6 +80,31 @@ Match rules are evaluated in order and only apply when a rule matches both `pref
 - `prefix`: match start of the requested path.
 - `suffix`: match end of the requested path.
 - `skip`: when `true`, matching paths are not cached.
+
+### Environment overrides
+Environment variables override values loaded from the HCL file. Mirrors defined in env are merged into the HCL mirror list. If an env mirror has the same `prefix` as an HCL mirror, it overrides that mirror's fields.
+
+Top-level overrides:
+- `REMIRROR_LISTEN`
+- `REMIRROR_DATA`
+
+Mirror overrides use the pattern `REMIRROR_MIRRORS_<name>_<FIELD>`.
+
+Supported fields:
+- `PREFIX` (required)
+- `UPSTREAM`
+- `UPSTREAMS` (comma-separated list)
+- `LOCAL`
+- `MATCHES` (comma-separated list of `prefix:suffix:skip` entries)
+
+Example:
+```sh
+export REMIRROR_LISTEN=":8080"
+export REMIRROR_DATA="/var/remirror"
+export REMIRROR_MIRRORS_ARCH_PREFIX="/archlinux/"
+export REMIRROR_MIRRORS_ARCH_UPSTREAMS="https://mirror1.example.com,https://mirror2.example.com"
+export REMIRROR_MIRRORS_ARCH_MATCHES="/core/:.pkg.tar.zst:false,/extra/:.pkg.tar.zst:false"
+```
 
 ## Cache behavior
 
@@ -101,6 +123,15 @@ If `matches` is configured for a mirror, only matching rules are considered and 
 - Range requests are proxied but are not cached.
 - Failed upstream responses with 404/500/503 are retried against the next upstream in the list.
 
-## See also
+## Docker
 
-Ansible playbook: https://gitlab.com/ciphermail/debops.remirror
+Build and run locally:
+```sh
+docker build -t remirror .
+docker run --rm -p 8080:8080 -v remirror-data:/var/remirror remirror
+```
+
+Compose:
+```sh
+docker compose up
+```
