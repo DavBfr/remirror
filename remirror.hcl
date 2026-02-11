@@ -100,37 +100,4 @@ mirrors {
 			match { pattern = "/simple/.*" action = "try" }
 		}
 	}
-
-	mirror {
-		# OpenTofu Registry with Terraform failover
-		# export TF_CLI_REGISTRY_MODULE_HOST="localhost:8080"
-		prefix = "/terraform/"
-		upstreams = [
-			"https://registry.opentofu.org",
-			"https://registry.terraform.io",
-		]
-		strip_prefix = true
-		matches {
-			match { pattern = "/.*\\.tar\\.gz$" action = "cache" }
-			match { pattern = "/v[0-9]+\\.[0-9]+\\.[0-9]+/.*" action = "try" }
-			match { pattern = "/metadata.*" action = "try" }
-		}
-	}
-
-	mirror {
-		# Docker Hub mirror
-		# Configure Docker to use: /etc/docker/daemon.json
-		# {
-		#   "registry-mirrors": ["http://localhost:8080/docker-hub"]
-		# }
-		# Then restart Docker: sudo systemctl restart docker
-		prefix = "/docker-hub/"
-		upstream = "https://registry-1.docker.io/"
-		strip_prefix = true
-		matches {
-			match { pattern = "/v2/.*/blobs/sha256:.*" action = "cache" }
-			match { pattern = "/v2/.*/manifests/.*" action = "try" rewrite = true }
-			match { pattern = "/v2/$" action = "skip" }
-		}
-	}
 }
