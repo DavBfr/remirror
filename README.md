@@ -25,7 +25,7 @@ go build .
 
 Flags:
 
-- `--version` prints the current version and exits.
+- `--verbose` enables verbose logging.
 - `-config` sets the config file path (defaults to `remirror.hcl`).
 
 ## Configuration

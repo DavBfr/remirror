@@ -22,8 +22,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const VERSION = "0.0.6"
-
 // Headers to exclude when making upstream requests (in addition to hop-by-hop headers)
 var excludeHeadersUpstream = map[string]bool{
 	"Range": true, // Always request full file from upstream, handle ranges locally
@@ -169,7 +167,7 @@ func decompressResponseBody(resp *http.Response) (io.ReadCloser, error) {
 		// Remove the Content-Encoding header since we're decompressing
 		resp.Header.Del("Content-Encoding")
 		resp.Header.Del("Content-Length") // Length will change after decompression
-		resp.ContentLength = -1            // Mark as unknown since decompressed size differs
+		resp.ContentLength = -1           // Mark as unknown since decompressed size differs
 		return gr, nil
 	case "deflate", "compress", "br":
 		// For now, log and pass through. Go's net/http doesn't support these natively
@@ -1179,15 +1177,10 @@ func start_eviction_scheduler(dataPath string, olderThanStr string) {
 
 func main() {
 	configPath := flag.String("config", "remirror.hcl", "Path to config file")
-	version := flag.Bool("version", false, "Print version and exit")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging")
 	flag.Parse()
 	verbose = *verboseFlag
 
-	if *version {
-		fmt.Println("remirror", VERSION)
-		os.Exit(0)
-	}
 	if flag.NArg() > 0 {
 		log.Fatalf("Unhandled arguments: %v", flag.Args())
 	}
