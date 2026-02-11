@@ -48,7 +48,63 @@ mirrors {
 	}
 
 	mirror {
+		# export GOPROXY="http://localhost:8080/golang"
+		# export GOSUMDB="off"
 		prefix = "/golang/"
 		upstream = "https://storage.googleapis.com"
+	}
+
+	mirror {
+		# export PUB_HOSTED_URL="http://localhost:8080/pub.dev"
+		prefix = "/pub.dev/"
+		upstream = "https://pub.dev/"
+		strip_prefix = true
+		matches {
+			match { pattern = "/api/packages/[^/]+/versions/[^/]+\\.tar\\.gz$" action = "cache" }
+			match { pattern = "/api/packages.*" action = "try" }
+			match { pattern = "/.*\\.tar\\.gz$" action = "cache" }
+		}
+	}
+
+	mirror {
+		# npm registry
+		# export npm_config_registry="http://localhost:8080/npm"
+		prefix = "/npm/"
+		upstream = "https://registry.npmjs.org"
+		strip_prefix = true
+		matches {
+			match { pattern = "/.*\\.tgz$" action = "cache" }
+			match { pattern = "/-/.*" action = "try" }
+		}
+	}
+
+	mirror {
+		# PyPI - Python Package Index
+		# pip install -i http://localhost:8080/pypi/simple package_name
+		# or add to ~/.pip/pip.conf: index-url = http://localhost:8080/pypi/simple
+		prefix = "/pypi/"
+		upstream = "https://pypi.org"
+		strip_prefix = true
+		matches {
+			match { pattern = "/packages/.*\\.(whl|tar\\.gz|zip)$" action = "cache" }
+			match { pattern = "/pypi/.*" action = "try" }
+			match { pattern = "/simple/.*" action = "try" }
+		}
+	}
+
+	mirror {
+		# OpenTofu Registry with Terraform failover
+		# export TF_CLI_REGISTRY_MODULE_HOST="localhost:8080"
+		prefix = "/terraform/"
+		upstreams = [
+			"https://registry.opentofu.org",
+			"https://registry.terraform.io",
+		]
+		strip_prefix = true
+		matches {
+			match { pattern = "/.*\\.tar\\.gz$" action = "cache" }
+			match { pattern = "/v[0-9]+\\.[0-9]+\\.[0-9]+/.*" action = "try" }
+			match { pattern = "/metadata.*" action = "try" }
+		}
 	}
 }

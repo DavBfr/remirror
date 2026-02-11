@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"database/sql"
 	"flag"
 	"fmt"
@@ -55,6 +56,11 @@ type Mirror struct {
 	// Incoming requests will have Prefix stripped off before being sent to Local.
 	// E.g. "/home/you/localrepos/archlinux"
 	Local string `hcl:"local"`
+
+	// StripPrefix when true, removes the Prefix from the request path before sending to upstream.
+	// Useful for mirrors that don't expect the prefix in the URL path.
+	// E.g. with prefix="/pub.dev/" and strip_prefix=true, /pub.dev/api/packages/foo becomes /api/packages/foo
+	StripPrefix bool `hcl:"strip_prefix"`
 
 	// If empty, nothing will be cached for this mirror
 	Matches []Match `hcl:"matches"`
@@ -142,6 +148,38 @@ func set_cache_metadata_headers(w http.ResponseWriter, etag, lastModified string
 // shouldExcludeHeader checks if a header should be excluded when proxying upstream
 func shouldExcludeHeader(k string) bool {
 	return hopHeaders[k] || excludeHeadersUpstream[k]
+}
+
+// decompressResponseBody returns a reader that decompresses the response body if needed
+// based on the Content-Encoding header, and removes the Content-Encoding header
+func decompressResponseBody(resp *http.Response) (io.ReadCloser, error) {
+	encoding := resp.Header.Get("Content-Encoding")
+	if encoding == "" {
+		return resp.Body, nil
+	}
+
+	vlog("decompressing response with Content-Encoding: %s", encoding)
+
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		// Remove the Content-Encoding header since we're decompressing
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length") // Length will change after decompression
+		resp.ContentLength = -1            // Mark as unknown since decompressed size differs
+		return gr, nil
+	case "deflate", "compress", "br":
+		// For now, log and pass through. Go's net/http doesn't support these natively
+		// Clients should send Accept-Encoding to get gzip instead
+		vlog("unsupported Content-Encoding: %s, passing through", encoding)
+		return resp.Body, nil
+	default:
+		// Unknown encoding, pass through
+		return resp.Body, nil
+	}
 }
 
 func touch_metadata(filePath string) {
@@ -292,8 +330,15 @@ func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) er
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.WriteHeader(resp.StatusCode)
 
+	// Decompress response body if needed
+	decompressed, err := decompressResponseBody(resp)
+	if err != nil {
+		return err
+	}
+	defer decompressed.Close()
+
 	// Stream response body
-	_, err = io.Copy(w, resp.Body)
+	_, err = io.Copy(w, decompressed)
 	return err
 }
 
@@ -335,10 +380,21 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				// while not encoding /
 				remote_url = strings.Replace(remote_url, "+", "%2B", -1)
 
-				if upstream.Path == "" {
-					remote_url += path.Clean(r.URL.Path)
+				urlPath := r.URL.Path
+				if mirror.StripPrefix {
+					// Strip the prefix from the URL path before sending to upstream
+					urlPath = strings.TrimPrefix(urlPath, mirror.Prefix)
+					if upstream.Path == "" {
+						remote_url += path.Clean(urlPath)
+					} else {
+						remote_url += path.Clean(upstream.Path + "/" + urlPath)
+					}
 				} else {
-					remote_url += path.Clean(upstream.Path + "/" + strings.TrimPrefix(r.URL.Path, mirror.Prefix))
+					if upstream.Path == "" {
+						remote_url += path.Clean(r.URL.Path)
+					} else {
+						remote_url += path.Clean(upstream.Path + "/" + strings.TrimPrefix(r.URL.Path, mirror.Prefix))
+					}
 				}
 
 				vlog("resolved upstream url: %s", remote_url)
@@ -457,6 +513,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					continue
 				}
 
+				// Decompress response body before caching/sending to client
+				decompressedBody, err := decompressResponseBody(resp)
+				if err != nil {
+					vlog("decompression error: %v", err)
+					return err
+				}
+				defer decompressedBody.Close()
+
 				out := io.Writer(w)
 
 				tmp_path := ""
@@ -521,7 +585,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 
 				write_resp_headers(w, resp)
 
-				n, err := io.Copy(out, resp.Body)
+				n, err := io.Copy(out, decompressedBody)
 				if err != nil {
 					log.Println(err)
 					return nil

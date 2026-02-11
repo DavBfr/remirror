@@ -84,6 +84,7 @@ Each `mirror` supports:
 - `upstream`: single upstream base URL.
 - `upstreams`: multiple upstream base URLs (used in order).
 - `local`: local directory served instead of an upstream.
+- `strip_prefix`: optional boolean. When true, removes the `prefix` from the request path before sending to upstream. Useful when the upstream doesn't expect the prefix in the URL. Default is false. Example: with `prefix="/pub.dev/"` and `strip_prefix=true`, a request to `/pub.dev/api/packages/foo` becomes `/api/packages/foo` when sent upstream.
 - `matches`: optional list of match rules to control cache behavior.
 
 Match rules control caching behavior with three possible actions:
