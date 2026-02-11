@@ -6,7 +6,8 @@ Caching HTTP proxy for distro and toolchain mirrors. It sits in front of one or 
 
 - Prefix-based routing to upstream mirrors or local directories.
 - On-disk cache with concurrent download fanout (multiple clients can read a single in-progress download).
-- Automatic cache validation using `If-Modified-Since` headers.
+- Automatic cache validation using `ETag` and `If-Modified-Since` headers.
+- ETags stored in SQLite for persistent cache validation.
 - Resilient operation: serves from cache when upstream is unavailable.
 - HCL configuration with env overrides.
 - Multiple upstreams per mirror with basic failover on 404/500/503.
@@ -124,7 +125,7 @@ Caching behavior is controlled by match rules with three actions:
 
 - **`action = "cache"` (default)**: Files are cached forever once downloaded. Subsequent requests are served directly from cache without contacting upstream.
 
-- **`action = "try"`**: Files are cached but validated with `If-Modified-Since` on every request. If upstream returns `304 Not Modified`, the cached version is served. If upstream is unreachable, the cache is still served.
+- **`action = "try"`**: Files are cached but validated with `ETag` (if available) or `If-Modified-Since` on every request. If upstream returns `304 Not Modified`, the cached version is served. If upstream is unreachable, the cache is still served.
 
 - **`action = "skip"`**: Files are never cached. Every request is proxied directly to upstream without storing on disk.
 
@@ -135,7 +136,8 @@ The default [remirror.hcl](remirror.hcl) includes `action = "try"` patterns for 
 ## Notes
 
 - Files without matching rules default to `action = "cache"` (cached forever).
-- Files with `action = "try"` are cached but validated with `If-Modified-Since` on every request.
+- Files with `action = "try"` are cached but validated using `ETag` (if available) or `If-Modified-Since` on every request.
+- ETags are stored in a SQLite database (`metadata.db`) located in the data directory for persistent cache validation.
 - Files with `action = "skip"` are never cached and always proxied to upstream.
 - When upstream mirrors are unreachable or return errors, cached versions are served automatically (for "cache" and "try" actions).
 - Range requests are served directly from cache without revalidation.

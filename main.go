@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/hcl"
+	_ "modernc.org/sqlite"
 )
 
 const VERSION = "0.0.6"
@@ -97,10 +99,98 @@ func (mirror Mirror) String() string {
 
 var (
 	http_client = http.Client{}
+	metaDB      *sql.DB
+	verbose     bool
 
 	downloads_mu sync.Mutex
 	downloads    = map[string]*Download{}
 )
+
+func vlog(format string, args ...interface{}) {
+	if verbose {
+		log.Printf(format, args...)
+	}
+}
+
+func vlog_headers(prefix string, headers http.Header) {
+	if !verbose {
+		return
+	}
+	for k, vs := range headers {
+		vlog("%s %s: %s", prefix, k, strings.Join(vs, ", "))
+	}
+}
+
+func set_cache_metadata_headers(w http.ResponseWriter, etag, lastModified string) {
+	if etag != "" {
+		w.Header().Set("ETag", etag)
+	}
+	if lastModified != "" {
+		w.Header().Set("Last-Modified", lastModified)
+	}
+}
+
+func etag_matches(headerValue, etag string) bool {
+	if headerValue == "*" {
+		return true
+	}
+	for _, part := range strings.Split(headerValue, ",") {
+		if strings.TrimSpace(part) == etag {
+			return true
+		}
+	}
+	return false
+}
+
+func handle_client_conditionals(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo) bool {
+	etag, lastModified, metaErr := get_metadata(local_path)
+	if metaErr != nil {
+		vlog("conditional metadata lookup failed for %s: %v", local_path, metaErr)
+	}
+	if lastModified == "" {
+		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
+	}
+
+	if inm := r.Header.Get("If-None-Match"); inm != "" && etag != "" {
+		if etag_matches(inm, etag) {
+			vlog("conditional If-None-Match hit for %s", local_path)
+			set_cache_metadata_headers(w, etag, lastModified)
+			w.Header().Set("Server", "remirror")
+			w.WriteHeader(http.StatusNotModified)
+			return true
+		}
+	}
+
+	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
+		if imsTime, err := http.ParseTime(ims); err == nil {
+			modTime := fileInfo.ModTime().UTC()
+			if lmTime, lmErr := http.ParseTime(lastModified); lmErr == nil {
+				modTime = lmTime.UTC()
+			}
+			if !modTime.After(imsTime) {
+				vlog("conditional If-Modified-Since hit for %s", local_path)
+				set_cache_metadata_headers(w, etag, lastModified)
+				w.Header().Set("Server", "remirror")
+				w.WriteHeader(http.StatusNotModified)
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func serve_cached(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, fileserver http.Handler) {
+	if handle_client_conditionals(w, r, local_path, fileInfo) {
+		return
+	}
+	etag, lastModified, _ := get_metadata(local_path)
+	if lastModified == "" {
+		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
+	}
+	set_cache_metadata_headers(w, etag, lastModified)
+	fileserver.ServeHTTP(w, r)
+}
 
 type Download struct {
 	resp *http.Response
@@ -113,6 +203,7 @@ func (mirror Mirror) should_skip(path string) bool {
 	// Don't cache files matching action="skip" patterns
 	for _, cm := range mirror.compiledMatches {
 		if cm.regex.MatchString(path) && cm.action == "skip" {
+			vlog("skip action matched for %s", path)
 			return true
 		}
 	}
@@ -123,6 +214,7 @@ func (mirror Mirror) should_revalidate(path string) bool {
 	// Revalidate files matching action="try" patterns
 	for _, cm := range mirror.compiledMatches {
 		if cm.regex.MatchString(path) && cm.action == "try" {
+			vlog("try action matched for %s", path)
 			return true
 		}
 	}
@@ -131,6 +223,7 @@ func (mirror Mirror) should_revalidate(path string) bool {
 
 // proxy_request forwards a request directly to upstream without caching
 func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) error {
+	vlog("proxying without cache: %s", remote_url)
 	req, err := http.NewRequest("GET", remote_url, nil)
 	if err != nil {
 		return err
@@ -144,12 +237,15 @@ func proxy_request(w http.ResponseWriter, r *http.Request, remote_url string) er
 			}
 		}
 	}
+	vlog_headers("proxy request", req.Header)
 
 	resp, err := http_client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	vlog("proxy response %d for %s", resp.StatusCode, remote_url)
+	vlog_headers("proxy response", resp.Header)
 
 	// Copy response headers
 	for k, vs := range resp.Header {
@@ -213,10 +309,14 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 					remote_url += path.Clean(upstream.Path + "/" + strings.TrimPrefix(r.URL.Path, mirror.Prefix))
 				}
 
+				vlog("resolved upstream url: %s", remote_url)
+
 				// Check if this should never be cached
 				if mirror.should_skip(remote_url) {
 					// Don't cache, proxy directly
-					proxy_request(w, r, remote_url)
+					if err := proxy_request(w, r, remote_url); err != nil {
+						vlog("proxy error for %s: %v", remote_url, err)
+					}
 					return nil
 				}
 
@@ -225,6 +325,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				// Check if we have a cached version
 				fileInfo, err := os.Stat(local_path)
 				if err == nil {
+					vlog("cache hit: %s", local_path)
 					// We have a cached file
 					if mirror.should_revalidate(remote_url) {
 						// Revalidate files matching action="try" patterns
@@ -234,7 +335,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 						// Revalidation indicated we need to download
 					} else {
 						// Cache forever - serve directly
-						fileserver.ServeHTTP(w, r)
+						serve_cached(w, r, local_path, fileInfo, fileserver)
 						return nil
 					}
 				}
@@ -247,6 +348,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				if r.Header.Get("Range") == "" && local_path != "" {
 					download, ok = downloads[local_path]
 					if ok {
+						vlog("waiting on in-progress download: %s", local_path)
 						fh, err := os.Open(download.tmp_path)
 						downloads_mu.Unlock()
 						if err != nil {
@@ -286,32 +388,37 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 						}
 					}
 				}
+				vlog_headers("upstream request", req.Header)
 
 				resp, err := http_client.Do(req)
 				if err != nil {
 					downloads_mu.Unlock()
+					vlog("upstream request failed: %v", err)
 					// If we have a cached version, serve it despite the error
 					if local_path != "" {
-						if _, statErr := os.Stat(local_path); statErr == nil {
+						if cachedInfo, statErr := os.Stat(local_path); statErr == nil {
 							log.Printf("Remote error, serving from cache: %v", err)
-							fileserver.ServeHTTP(w, r)
+							serve_cached(w, r, local_path, cachedInfo, fileserver)
 							return nil
 						}
 					}
 					return err
 				}
 				defer resp.Body.Close()
+				vlog("upstream response %d for %s", resp.StatusCode, remote_url)
+				vlog_headers("upstream response", resp.Header)
 
 				// Try another mirror if we get certain status codes
 				if resp.StatusCode == 404 ||
 					resp.StatusCode == 500 ||
 					resp.StatusCode == 503 {
+					vlog("upstream returned %d for %s", resp.StatusCode, remote_url)
 					downloads_mu.Unlock()
 					// If we have a cached version and got 404/500/503, serve from cache
 					if local_path != "" && resp.StatusCode != 404 {
-						if _, statErr := os.Stat(local_path); statErr == nil {
+						if cachedInfo, statErr := os.Stat(local_path); statErr == nil {
 							log.Printf("Remote returned %d, serving from cache", resp.StatusCode)
-							fileserver.ServeHTTP(w, r)
+							serve_cached(w, r, local_path, cachedInfo, fileserver)
 							return nil
 						}
 					}
@@ -327,6 +434,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				// We don't want to cache the result if the server
 				// returns with a 206 Partial Content
 				if resp.StatusCode == 200 && local_path != "" {
+					vlog("downloading to cache: %s", local_path)
 					tmp, err := ioutil.TempFile(config.Data, "remirror_tmp_")
 					if err != nil {
 						downloads_mu.Unlock()
@@ -380,6 +488,7 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 				}()
 
 				write_resp_headers(w, resp)
+				vlog("upstream response %d for %s", resp.StatusCode, remote_url)
 
 				n, err := io.Copy(out, resp.Body)
 				if err != nil {
@@ -418,6 +527,23 @@ func (mirror Mirror) CreateHandler(config *Config, fileserver http.Handler) (htt
 						log.Println(err)
 						return nil
 					}
+
+					// Store ETag and Last-Modified
+					etag := resp.Header.Get("ETag")
+					lastModified := resp.Header.Get("Last-Modified")
+					if lastModified == "" {
+						if info, statErr := os.Stat(local_path); statErr == nil {
+							lastModified = info.ModTime().UTC().Format(http.TimeFormat)
+						}
+					}
+					if lastModified == "" {
+						lastModified = time.Now().UTC().Format(http.TimeFormat)
+					}
+					vlog("storing metadata for %s (etag=%q, last_modified=%q)", local_path, etag, lastModified)
+					if err := store_metadata(local_path, etag, lastModified); err != nil {
+						log.Printf("Warning: failed to store metadata: %v", err)
+					}
+
 					log.Println(">:)")
 				}
 
@@ -458,7 +584,7 @@ func load_configs(config *Config, configPath string) error {
 	return nil
 }
 
-// revalidate_cache checks if the cached file is still valid using If-Modified-Since
+// revalidate_cache checks if the cached file is still valid using ETag or If-Modified-Since
 // Returns true if the request was handled (either 304 or served from cache)
 func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string, fileInfo os.FileInfo, remote_url string, fileserver http.Handler) bool {
 	// Don't revalidate on Range requests
@@ -471,12 +597,29 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if err != nil {
 		// If we can't create the request, serve from cache
 		log.Printf("Error creating revalidation request, serving from cache: %v", err)
-		fileserver.ServeHTTP(w, r)
+		serve_cached(w, r, local_path, fileInfo, fileserver)
 		return true
 	}
 
-	// Add If-Modified-Since header
-	req.Header.Set("If-Modified-Since", fileInfo.ModTime().UTC().Format(http.TimeFormat))
+	// Try to use ETag and Last-Modified if we have them stored
+	etag, lastModified, metaErr := get_metadata(local_path)
+	if metaErr == nil && etag != "" {
+		req.Header.Set("If-None-Match", etag)
+		vlog("revalidate ETag for %s: %s", local_path, etag)
+	} else if metaErr != nil {
+		vlog("revalidate metadata lookup failed for %s: %v", local_path, metaErr)
+	} else {
+		vlog("no stored ETag for %s", local_path)
+	}
+
+	// Add If-Modified-Since header as fallback
+	ims := lastModified
+	if ims == "" {
+		ims = fileInfo.ModTime().UTC().Format(http.TimeFormat)
+	}
+	req.Header.Set("If-Modified-Since", ims)
+	vlog("revalidate If-Modified-Since for %s: %s", local_path, ims)
+	vlog_headers("revalidate request", req.Header)
 
 	// Copy original request headers
 	for k, vs := range r.Header {
@@ -491,15 +634,17 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if err != nil {
 		// Network error, serve from cache
 		log.Printf("Remote unreachable during revalidation, serving from cache: %v", err)
-		fileserver.ServeHTTP(w, r)
+		serve_cached(w, r, local_path, fileInfo, fileserver)
 		return true
 	}
 	defer resp.Body.Close()
+	vlog("revalidate response %d for %s", resp.StatusCode, remote_url)
+	vlog_headers("revalidate response", resp.Header)
 
 	if resp.StatusCode == 304 {
 		// Not modified, serve from cache
 		log.Printf("Cache hit (304): %s", local_path)
-		fileserver.ServeHTTP(w, r)
+		serve_cached(w, r, local_path, fileInfo, fileserver)
 		return true
 	}
 
@@ -513,7 +658,7 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 	if resp.StatusCode >= 500 {
 		// Server error, serve from cache
 		log.Printf("Remote error %d during revalidation, serving from cache", resp.StatusCode)
-		fileserver.ServeHTTP(w, r)
+		serve_cached(w, r, local_path, fileInfo, fileserver)
 		return true
 	}
 
@@ -521,13 +666,13 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, local_path string,
 		// File no longer exists upstream, but we have it cached
 		// Serve from cache anyway
 		log.Printf("File not found upstream (404), serving from cache: %s", local_path)
-		fileserver.ServeHTTP(w, r)
+		serve_cached(w, r, local_path, fileInfo, fileserver)
 		return true
 	}
 
 	// For other status codes, serve from cache
 	log.Printf("Unexpected status %d during revalidation, serving from cache", resp.StatusCode)
-	fileserver.ServeHTTP(w, r)
+	serve_cached(w, r, local_path, fileInfo, fileserver)
 	return true
 }
 
@@ -715,10 +860,100 @@ func parse_matches(value string) ([]Match, error) {
 	return matches, nil
 }
 
+// init_metadata_db initializes the SQLite database for storing ETags
+func init_metadata_db(dataPath string) error {
+	dbPath := path.Join(dataPath, "metadata.db")
+
+	// Ensure the data directory exists
+	if err := os.MkdirAll(dataPath, 0755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Create the metadata table
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS etags (
+			path TEXT PRIMARY KEY,
+			etag TEXT NOT NULL,
+			last_modified DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL
+		)
+	`)
+	if err != nil {
+		db.Close()
+		return fmt.Errorf("failed to create etags table: %w", err)
+	}
+
+	metaDB = db
+	return nil
+}
+
+// store_metadata saves ETag and Last-Modified for a given file path
+func store_metadata(filePath, etag, lastModified string) error {
+	if metaDB == nil {
+		return fmt.Errorf("metadata database not initialized")
+	}
+
+	// Avoid updating updated_at when metadata hasn't changed.
+	var existingEtag string
+	var existingLastModified string
+	err := metaDB.QueryRow(`SELECT etag, last_modified FROM etags WHERE path = ?`, filePath).Scan(&existingEtag, &existingLastModified)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	if lastModified == "" {
+		lastModified = existingLastModified
+	}
+	if lastModified == "" {
+		lastModified = time.Now().UTC().Format(http.TimeFormat)
+	}
+	if err == nil && existingEtag == etag && existingLastModified == lastModified {
+		vlog("metadata unchanged for %s", filePath)
+		return nil
+	}
+
+	if err == nil {
+		vlog("metadata updated for %s: etag %q -> %q, last_modified %q -> %q", filePath, existingEtag, etag, existingLastModified, lastModified)
+	} else {
+		vlog("metadata inserted for %s: etag %q, last_modified %q", filePath, etag, lastModified)
+	}
+
+	_, err = metaDB.Exec(
+		`INSERT OR REPLACE INTO etags (path, etag, last_modified, updated_at) VALUES (?, ?, ?, ?)`,
+		filePath, etag, lastModified, time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// get_metadata retrieves stored ETag and Last-Modified for a given file path
+func get_metadata(filePath string) (string, string, error) {
+	if metaDB == nil {
+		return "", "", fmt.Errorf("metadata database not initialized")
+	}
+
+	var etag string
+	var lastModified string
+	err := metaDB.QueryRow(`SELECT etag, last_modified FROM etags WHERE path = ?`, filePath).Scan(&etag, &lastModified)
+	if err == sql.ErrNoRows {
+		vlog("metadata not found for %s", filePath)
+		return "", "", nil // No metadata stored, not an error
+	}
+	if err == nil {
+		vlog("metadata loaded for %s: etag=%q last_modified=%q", filePath, etag, lastModified)
+	}
+	return etag, lastModified, err
+}
+
 func main() {
 	configPath := flag.String("config", "remirror.hcl", "Path to config file")
 	version := flag.Bool("version", false, "Print version and exit")
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose logging")
 	flag.Parse()
+	verbose = *verboseFlag
 
 	if *version {
 		fmt.Println("remirror", VERSION)
@@ -736,6 +971,13 @@ func main() {
 	if err := apply_env_overrides(config); err != nil {
 		log.Fatalf("Env override error: %v", err)
 	}
+
+	// Initialize metadata database for ETag storage
+	if err := init_metadata_db(config.Data); err != nil {
+		log.Fatalf("Failed to initialize metadata database: %v", err)
+	}
+	defer metaDB.Close()
+	vlog("metadata database initialized in %s", config.Data)
 
 	fileserver := http.FileServer(http.Dir(config.Data))
 

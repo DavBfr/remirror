@@ -4,10 +4,12 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - remirror-data:/var/remirror
+      - ./data:/var/remirror
     develop:
       watch:
-        - path: /*.go
+        - path: /main.go
+          action: rebuild
+        - path: /misc.go
           action: rebuild
         - path: ./go.mod
           action: rebuild
@@ -17,6 +19,3 @@ services:
           action: rebuild
         - path: ./remirror.hcl
           action: rebuild
-
-volumes:
-  remirror-data: {}
