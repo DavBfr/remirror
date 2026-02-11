@@ -11,7 +11,7 @@ Caching HTTP proxy for distro and toolchain mirrors. It sits in front of one or 
 
 ## Build and run
 
-You need a working Go installation (https://golang.org/doc/install).
+You need a working Go installation (<https://golang.org/doc/install>).
 
 ```sh
 go build .
@@ -37,6 +37,12 @@ mirrors {
     mirror {
         prefix = "/archlinux/"
         upstream = "https://mirrors.xmission.com"
+        matches {
+            match { pattern = "/(Packages|Sources)\\.gz$" skip = true }
+            match { pattern = "\\.(abs|db|files|links)\\.tar\\.gz$" skip = true }
+            match { pattern = "\\.(xz|gz|bz2|zip|tgz|rpm|deb|jar)$" }
+            match { pattern = "-rpm\\.bin$" }
+        }
     }
 
     mirror {
@@ -73,50 +79,49 @@ Each `mirror` supports:
 - `upstream`: single upstream base URL.
 - `upstreams`: multiple upstream base URLs (used in order).
 - `local`: local directory served instead of an upstream.
-- `matches`: optional list of match rules to control caching behavior.
+- `matches`: list of match rules that control caching behavior.
 
-Match rules are evaluated in order and only apply when a rule matches both `prefix` and `suffix`:
+Match rules are evaluated in order and the first matching rule wins:
 
-- `prefix`: match start of the requested path.
-- `suffix`: match end of the requested path.
+- `pattern`: Regular expression pattern to match against the request path.
 - `skip`: when `true`, matching paths are not cached.
 
 ### Environment overrides
+
 Environment variables override values loaded from the HCL file. Mirrors defined in env are merged into the HCL mirror list. If an env mirror has the same `prefix` as an HCL mirror, it overrides that mirror's fields.
 
 Top-level overrides:
+
 - `REMIRROR_LISTEN`
 - `REMIRROR_DATA`
 
 Mirror overrides use the pattern `REMIRROR_MIRRORS_<name>_<FIELD>`.
 
 Supported fields:
+
 - `PREFIX` (required)
 - `UPSTREAM`
 - `UPSTREAMS` (comma-separated list)
 - `LOCAL`
-- `MATCHES` (comma-separated list of `prefix:suffix:skip` entries)
+- `MATCHES` (comma-separated list of `pattern[:skip]` entries)
 
 Example:
+
 ```sh
 export REMIRROR_LISTEN=":8080"
 export REMIRROR_DATA="/var/remirror"
 export REMIRROR_MIRRORS_ARCH_PREFIX="/archlinux/"
 export REMIRROR_MIRRORS_ARCH_UPSTREAMS="https://mirror1.example.com,https://mirror2.example.com"
-export REMIRROR_MIRRORS_ARCH_MATCHES="/core/:.pkg.tar.zst:false,/extra/:.pkg.tar.zst:false"
+export REMIRROR_MIRRORS_ARCH_MATCHES='\\.pkg\\.tar\\.zst$,\\.sig$'
 ```
 
 ## Cache behavior
 
-By default, remirror caches file types that look like archives or packages:
-`.xz`, `.gz`, `.bz2`, `.zip`, `.tgz`, `.rpm`, `-rpm.bin`, `.deb`, `.jar`, `.xz.sig`.
+Caching is driven entirely by `matches` regular expressions. If a mirror has no match rules, nothing is cached for that mirror. Rules are evaluated in order and the first matching rule wins.
 
-Special-case exclusions:
-
-- Debian/Ubuntu index files: `*/Packages.gz`, `*/Sources.gz`.
-- Arch repo metadata: `*.abs.tar.gz`, `*.db.tar.gz`, `*.files.tar.gz`, `*.links.tar.gz`.
-
-If `matches` is configured for a mirror, only matching rules are considered and the default list is ignored.
+The default [remirror.hcl](remirror.hcl) includes patterns that:
+- Skip repo metadata (such as `*/Packages.gz` and `*.db.tar.gz`).
+- Cache common archive and package formats (`.xz`, `.rpm`, `.deb`, etc).
 
 ## Notes
 
@@ -126,12 +131,14 @@ If `matches` is configured for a mirror, only matching rules are considered and 
 ## Docker
 
 Build and run locally:
+
 ```sh
 docker build -t remirror .
 docker run --rm -p 8080:8080 -v remirror-data:/var/remirror remirror
 ```
 
 Compose:
+
 ```sh
 docker compose up
 ```

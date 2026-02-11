@@ -10,8 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,13 +48,21 @@ type Mirror struct {
 	// E.g. "/home/you/localrepos/archlinux"
 	Local string
 
-	// If nil, default match set will be used
+	// If empty, nothing will be cached for this mirror
 	Matches []Match
+
+	// Compiled regexes for matches, populated after config load
+	compiledMatches []*compiledMatch
 }
+
 type Match struct {
-	Prefix string
-	Suffix string
-	Skip   bool // skip = true means this is a "don't match" rule
+	Pattern string // Regular expression pattern
+	Skip    bool   // skip = true means this is a "don't match" rule
+}
+
+type compiledMatch struct {
+	regex *regexp.Regexp
+	skip  bool
 }
 
 func (mirror Mirror) String() string {
@@ -75,7 +83,7 @@ func (mirror Mirror) String() string {
 	}
 	s += " "
 	for i, m := range mirror.Matches {
-		ss := m.Prefix + "*" + m.Suffix
+		ss := m.Pattern
 		if m.Skip {
 			ss += " skip"
 		}
@@ -102,42 +110,13 @@ type Download struct {
 }
 
 func (mirror Mirror) should_cache(path string) bool {
-	// Special rules for Debian/Ubuntu
-	if strings.HasSuffix(path, "/Packages.gz") || strings.HasSuffix(path, "/Sources.gz") {
+	if len(mirror.compiledMatches) == 0 {
 		return false
 	}
-
-	// Special rules for Arch
-	if strings.HasSuffix(path, ".abs.tar.gz") ||
-		strings.HasSuffix(path, ".db.tar.gz") ||
-		strings.HasSuffix(path, ".files.tar.gz") ||
-		strings.HasSuffix(path, ".links.tar.gz") {
-		return false
-	}
-
-	// Use custom match rules?
-	if len(mirror.Matches) > 0 {
-		for _, m := range mirror.Matches {
-			if strings.HasPrefix(path, m.Prefix) &&
-				strings.HasSuffix(path, m.Suffix) {
-				return !m.Skip
-			}
+	for _, cm := range mirror.compiledMatches {
+		if cm.regex.MatchString(path) {
+			return !cm.skip
 		}
-		return false
-	}
-
-	// Otherwise cache everything that looks like an archive.
-	if strings.HasSuffix(path, ".xz") ||
-		strings.HasSuffix(path, ".gz") ||
-		strings.HasSuffix(path, ".bz2") ||
-		strings.HasSuffix(path, ".zip") ||
-		strings.HasSuffix(path, ".tgz") ||
-		strings.HasSuffix(path, ".rpm") ||
-		strings.HasSuffix(path, "-rpm.bin") ||
-		strings.HasSuffix(path, ".deb") ||
-		strings.HasSuffix(path, ".jar") ||
-		strings.HasSuffix(path, ".xz.sig") {
-		return true
 	}
 	return false
 }
@@ -382,6 +361,30 @@ func load_configs(config *Config, configPath string) error {
 	if err := hcl.Unmarshal(configBytes, config); err != nil {
 		return err
 	}
+	// Compile regex patterns
+	for i := range config.Mirrors {
+		if err := compile_mirror_matches(&config.Mirrors[i]); err != nil {
+			return fmt.Errorf("Mirror %s: %w", config.Mirrors[i].Prefix, err)
+		}
+	}
+	return nil
+}
+
+func compile_mirror_matches(mirror *Mirror) error {
+	mirror.compiledMatches = make([]*compiledMatch, 0, len(mirror.Matches))
+	for i, m := range mirror.Matches {
+		if m.Pattern == "" {
+			return fmt.Errorf("Match rule %d has empty pattern", i)
+		}
+		re, err := regexp.Compile(m.Pattern)
+		if err != nil {
+			return fmt.Errorf("Match rule %d pattern %q: %w", i, m.Pattern, err)
+		}
+		mirror.compiledMatches = append(mirror.compiledMatches, &compiledMatch{
+			regex: re,
+			skip:  m.Skip,
+		})
+	}
 	return nil
 }
 
@@ -463,11 +466,17 @@ func apply_env_overrides(config *Config) error {
 		for i := range config.Mirrors {
 			if config.Mirrors[i].Prefix == src.Prefix {
 				override_mirror(&config.Mirrors[i], src)
+				if err := compile_mirror_matches(&config.Mirrors[i]); err != nil {
+					return fmt.Errorf("Env mirror %s: %w", src.Prefix, err)
+				}
 				applied = true
 				break
 			}
 		}
 		if !applied {
+			if err := compile_mirror_matches(src); err != nil {
+				return fmt.Errorf("Env mirror %s: %w", src.Prefix, err)
+			}
 			config.Mirrors = append(config.Mirrors, *src)
 		}
 	}
@@ -520,19 +529,14 @@ func parse_matches(value string) ([]Match, error) {
 			continue
 		}
 		parts := strings.Split(entry, ":")
-		if len(parts) < 2 || len(parts) > 3 {
-			return nil, fmt.Errorf("Invalid match entry %q (expected prefix:suffix[:skip])", entry)
+		if len(parts) < 1 || len(parts) > 2 {
+			return nil, fmt.Errorf("Invalid match entry %q (expected pattern[:skip])", entry)
 		}
 		m := Match{
-			Prefix: parts[0],
-			Suffix: parts[1],
+			Pattern: parts[0],
 		}
-		if len(parts) == 3 {
-			b, err := strconv.ParseBool(parts[2])
-			if err != nil {
-				return nil, fmt.Errorf("Invalid match skip value %q in %q", parts[2], entry)
-			}
-			m.Skip = b
+		if len(parts) == 2 {
+			m.Skip = parts[1] == "true" || parts[1] == "1"
 		}
 		matches = append(matches, m)
 	}
@@ -613,7 +617,8 @@ func tmp_download(local_path string, w http.ResponseWriter, download *Download, 
 		written += n
 
 		if err != nil && err != io.EOF {
-			log.Printf("Error while reading concurrent download %#s from %#s: %v\n",
+			log.Printf(`Error while reading concurrent download %s from %s: %v
+`,
 				local_path, download.tmp_path, err)
 			// Not an HTTP error: just return, and the client will hopefully
 			// handle a short read correctly.
@@ -637,7 +642,7 @@ func tmp_download(local_path string, w http.ResponseWriter, download *Download, 
 		case <-time.After(time.Second):
 			// 60 second timeout for the other goroutine to at least write _something_
 			if time.Since(last) > time.Minute {
-				log.Println("Timeout while reading concurrent download %#s from %#s\n",
+				log.Printf("Timeout while reading concurrent download %s from %s\n",
 					local_path,
 					download.tmp_path)
 				// Not an HTTP error: just return, and the client will hopefully
