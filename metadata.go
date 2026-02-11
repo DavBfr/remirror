@@ -18,16 +18,18 @@ func init_metadata_db(dataPath string) error {
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	// Use URI format with proper SQLite options
+	dsn := "file:" + dbPath + "?cache=shared&mode=rwc"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 
-	// Enable WAL mode for better concurrency
-	_, err = db.Exec("PRAGMA journal_mode=WAL")
+	// Use DELETE mode instead of WAL to avoid I/O issues on network/unstable filesystems
+	_, err = db.Exec("PRAGMA journal_mode=DELETE")
 	if err != nil {
 		db.Close()
-		return fmt.Errorf("failed to enable WAL: %w", err)
+		return fmt.Errorf("failed to set journal mode: %w", err)
 	}
 
 	// Set busy timeout to 5 seconds to handle concurrent writes
@@ -36,6 +38,25 @@ func init_metadata_db(dataPath string) error {
 		db.Close()
 		return fmt.Errorf("failed to set busy timeout: %w", err)
 	}
+
+	// Enable synchronous mode for data safety
+	_, err = db.Exec("PRAGMA synchronous=NORMAL")
+	if err != nil {
+		db.Close()
+		return fmt.Errorf("failed to set synchronous: %w", err)
+	}
+
+	// Set cache size for better performance
+	_, err = db.Exec("PRAGMA cache_size=2000")
+	if err != nil {
+		db.Close()
+		return fmt.Errorf("failed to set cache size: %w", err)
+	}
+
+	// Configure connection pool
+	db.SetMaxOpenConns(1) // SQLite works best with single connection
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
 
 	// Create the metadata table
 	_, err = db.Exec(`
@@ -99,6 +120,9 @@ func store_metadata(filePath, etag, lastModified string) error {
 		`INSERT OR REPLACE INTO files (id, path, etag, last_modified, updated_at) VALUES (?, ?, ?, ?, ?)`,
 		hashID, filePath, etag, lastModified, time.Now().UTC().Format(time.RFC3339),
 	)
+	if err != nil {
+		vlog("metadata exec failed: %v", err)
+	}
 	return err
 }
 
@@ -108,6 +132,10 @@ func get_metadata(filePath string) (string, string, string, error) {
 	if metaDB == nil {
 		return "", "", "", fmt.Errorf("metadata database not initialized")
 	}
+
+	// Serialize database writes to prevent SQLITE_BUSY errors
+	metaDB_mu.Lock()
+	defer metaDB_mu.Unlock()
 
 	// Normalize the path to remove cacheRoot prefix
 	filePath = normalize_path(filePath)

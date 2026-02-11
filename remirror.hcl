@@ -70,9 +70,7 @@ mirrors {
 		upstream = "https://pub.dev/"
 		strip_prefix = true
 		matches {
-			match { pattern = "/api/packages/[^/]+/versions/[^/]+\\.tar\\.gz$" action = "cache" }
-			match { pattern = "/api/packages.*" action = "try" }
-			match { pattern = "/.*\\.tar\\.gz$" action = "cache" }
+			match { pattern = "/api/packages/.*" action = "try" rewrite = true }
 		}
 	}
 
