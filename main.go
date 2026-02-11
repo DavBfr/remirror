@@ -186,7 +186,7 @@ func decompressResponseBody(resp *http.Response) (io.ReadCloser, error) {
 	}
 }
 
-func serve_cached(w http.ResponseWriter, r *http.Request, request_path string, fileInfo os.FileInfo, fileserver http.Handler) {
+func serve_cached(w http.ResponseWriter, r *http.Request, request_path string, storage_path string, fileInfo os.FileInfo, fileserver http.Handler) {
 	if handle_client_conditionals(w, r, request_path, fileInfo) {
 		return
 	}
@@ -196,13 +196,23 @@ func serve_cached(w http.ResponseWriter, r *http.Request, request_path string, f
 		lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
 	}
 	set_cache_metadata_headers(w, etag, lastModified)
-	fileserver.ServeHTTP(w, r)
+
+	// Open file and serve it (handles Range requests automatically)
+	file, err := os.Open(storage_path)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	defer file.Close()
+
+	// Use http.ServeContent which handles Range requests, If-Range, etc.
+	http.ServeContent(w, r, path.Base(storage_path), fileInfo.ModTime(), file)
 }
 
 // serve_cached_with_rewrite serves cached content with URL rewriting if needed
 func serve_cached_with_rewrite(w http.ResponseWriter, r *http.Request, request_path string, storage_path string, fileInfo os.FileInfo, fileserver http.Handler, shouldRewrite bool, upstreamURL string, replacementURL string) {
 	if !shouldRewrite {
-		serve_cached(w, r, request_path, fileInfo, fileserver)
+		serve_cached(w, r, request_path, storage_path, fileInfo, fileserver)
 		return
 	}
 
@@ -743,7 +753,15 @@ func revalidate_cache(w http.ResponseWriter, r *http.Request, request_path strin
 			lastModified = fileInfo.ModTime().UTC().Format(http.TimeFormat)
 		}
 		set_cache_metadata_headers(w, etag, lastModified)
-		fileserver.ServeHTTP(w, r)
+
+		// Open file and serve it with Range support
+		file, err := os.Open(storage_path)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return true
+		}
+		defer file.Close()
+		http.ServeContent(w, r, path.Base(storage_path), fileInfo.ModTime(), file)
 		return true
 	}
 
