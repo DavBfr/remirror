@@ -25,4 +25,4 @@ COPY --from=build /out/ /
 
 EXPOSE 8080
 
-ENTRYPOINT ["/remirror", "-verbose"]
+ENTRYPOINT ["/remirror"]

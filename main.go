@@ -1216,17 +1216,26 @@ func main() {
 	}
 	cacheRoot = config.Data
 
-	// Initialize HTTP client with upstream timeout
-	timeoutDuration := 30 * time.Second // default timeout
+	// Initialize HTTP client with connection timeout (not total request timeout)
+	connectTimeout := 30 * time.Second // default timeout
 	if config.UpstreamTimeout != "" {
 		parsed, err := time.ParseDuration(config.UpstreamTimeout)
 		if err != nil {
 			log.Fatalf("Invalid upstream_timeout value: %v", err)
 		}
-		timeoutDuration = parsed
+		connectTimeout = parsed
 	}
-	http_client.Timeout = timeoutDuration
-	vlog("upstream timeout set to %v", timeoutDuration)
+	// Configure transport with dial timeout only, no overall request timeout
+	http_client.Transport = &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   connectTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: connectTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	vlog("upstream connection timeout set to %v", connectTimeout)
 
 	// Initialize metadata database for ETag storage
 	if err := init_metadata_db(config.Data); err != nil {

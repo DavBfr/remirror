@@ -49,6 +49,14 @@ mirrors {
 	}
 
 	mirror {
+		prefix = "/ubuntu-cd/"
+		upstream = "https://mirrors.xmission.com"
+		matches {
+			match { pattern = ".*/SHA256SUMS.*" action = "try" }
+			}
+	}
+
+	mirror {
 		# export GOPROXY="http://localhost:8080/golang"
 		# export GOSUMDB="off"
 		prefix = "/golang/"
@@ -71,7 +79,7 @@ mirrors {
 		# npm registry
 		# export npm_config_registry="http://localhost:8080/npm"
 		prefix = "/npm/"
-		upstream = "https://registry.npmjs.org"
+		upstream = "https://registry.npmjs.org/"
 		strip_prefix = true
 		matches {
 			match { pattern = "/.*\\.tgz$" action = "cache" }
