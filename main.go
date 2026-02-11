@@ -29,14 +29,15 @@ var excludeHeadersUpstream = map[string]bool{
 }
 
 type Config struct {
-	Listen  string // HTTP listen address. ":8080"
-	Data    string // Storage location for cached files. "/var/remirror"
-	Mirrors []Mirror
+	Listen         string   `hcl:"listen"`
+	Data           string   `hcl:"data"`
+	EvictOlderThan string   `hcl:"evict_older_than"`
+	Mirrors        []Mirror `hcl:"mirrors"`
 }
 type Mirror struct {
 	// Prefix specifies a path that should be sent
 	// to a certain upstream. E.g. "/archlinux/"
-	Prefix string
+	Prefix string `hcl:"prefix"`
 
 	// Upstream specifies the upstream protocol and host.
 	// You may also specify a path, in which case Prefix is
@@ -45,26 +46,26 @@ type Mirror struct {
 	//
 	// E.g. "https://mirrors.kernel.org"     (/archlinux/somepackage will be preserved)
 	// E.g. "http://mirror.cs.umn.edu/arch/" (/archlinux/thing will transform to /arch/thing)
-	Upstream string
+	Upstream string `hcl:"upstream"`
 
 	// Upstreams specifies multiple Upstream entries. You can specify both (all will be used).
-	Upstreams []string
+	Upstreams []string `hcl:"upstreams"`
 
 	// Local should be used instead of Upstream for a locally served folder.
 	// Incoming requests will have Prefix stripped off before being sent to Local.
 	// E.g. "/home/you/localrepos/archlinux"
-	Local string
+	Local string `hcl:"local"`
 
 	// If empty, nothing will be cached for this mirror
-	Matches []Match
+	Matches []Match `hcl:"matches"`
 
 	// Compiled regexes for matches, populated after config load
 	compiledMatches []*compiledMatch
 }
 
 type Match struct {
-	Pattern string // Regular expression pattern
-	Action  string // action = "cache" (default), "try" (cache with revalidation), or "skip" (don't cache)
+	Pattern string `hcl:"pattern"`
+	Action  string `hcl:"action"`
 }
 
 type compiledMatch struct {
@@ -745,6 +746,9 @@ func apply_env_overrides(config *Config) error {
 	if v := strings.TrimSpace(os.Getenv("REMIRROR_DATA")); v != "" {
 		config.Data = v
 	}
+	if v := strings.TrimSpace(os.Getenv("REMIRROR_EVICT_OLDER_THAN")); v != "" {
+		config.EvictOlderThan = v
+	}
 
 	mirrorsByName := map[string]*Mirror{}
 
@@ -1006,6 +1010,109 @@ func get_metadata(filePath string) (string, string, error) {
 	return etag, lastModified, err
 }
 
+// evict_old_files deletes cached files with updated_at older than the specified duration
+func evict_old_files(dataPath string, olderThanDuration time.Duration) error {
+	if metaDB == nil || olderThanDuration <= 0 {
+		return nil
+	}
+
+	cutoffTime := time.Now().Add(-olderThanDuration)
+	cutoffTimeStr := cutoffTime.UTC().Format(time.RFC3339)
+	var deletedCount int
+	var deletedSize int64
+
+	vlog("starting cache eviction for files with updated_at before %s", cutoffTimeStr)
+
+	// Query database for all files with updated_at < cutoffTime
+	rows, err := metaDB.Query(`SELECT path FROM files WHERE updated_at < ?`, cutoffTimeStr)
+	if err != nil {
+		return fmt.Errorf("failed to query eviction candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var filesToEvict []string
+	for rows.Next() {
+		var relPath string
+		if err := rows.Scan(&relPath); err != nil {
+			return fmt.Errorf("failed to scan path: %w", err)
+		}
+		filesToEvict = append(filesToEvict, relPath)
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating eviction candidates: %w", err)
+	}
+
+	// Delete files and their database entries
+	for _, relPath := range filesToEvict {
+		fullPath := path.Join(dataPath, relPath)
+
+		// Get file size before deletion
+		fileSize := int64(0)
+		if info, statErr := os.Stat(fullPath); statErr == nil {
+			fileSize = info.Size()
+		}
+
+		// Delete file from filesystem
+		if err := os.Remove(fullPath); err != nil {
+			vlog("failed to delete file %s: %v", fullPath, err)
+			// Continue with other files even if one fails
+			continue
+		}
+
+		// Delete entry from database
+		if _, err := metaDB.Exec(`DELETE FROM files WHERE path = ?`, relPath); err != nil {
+			vlog("failed to delete database entry for %s: %v", relPath, err)
+		}
+
+		deletedCount++
+		deletedSize += fileSize
+		vlog("evicted file: %s (updated_at before %s)", relPath, cutoffTimeStr)
+	}
+
+	log.Printf("cache eviction complete: deleted %d files (%.2f MB)", deletedCount, float64(deletedSize)/1024/1024)
+	return nil
+}
+
+// start_eviction_scheduler starts a daily cache eviction task
+func start_eviction_scheduler(dataPath string, olderThanStr string) {
+	if strings.TrimSpace(olderThanStr) == "" {
+		vlog("cache eviction is disabled")
+		return
+	}
+
+	// Parse the duration
+	olderThan, err := time.ParseDuration(olderThanStr)
+	if err != nil {
+		log.Printf("Warning: invalid evict_older_than value %q: %v", olderThanStr, err)
+		return
+	}
+
+	if olderThan <= 0 {
+		log.Printf("Warning: evict_older_than must be positive, got %v", olderThan)
+		return
+	}
+
+	log.Printf("cache eviction enabled: deleting files older than %v", olderThan)
+
+	// Run eviction immediately
+	if err := evict_old_files(dataPath, olderThan); err != nil {
+		log.Printf("initial cache eviction failed: %v", err)
+	}
+
+	// Schedule daily eviction in a background goroutine
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if err := evict_old_files(dataPath, olderThan); err != nil {
+				log.Printf("scheduled cache eviction failed: %v", err)
+			}
+		}
+	}()
+}
+
 func main() {
 	configPath := flag.String("config", "remirror.hcl", "Path to config file")
 	version := flag.Bool("version", false, "Print version and exit")
@@ -1037,6 +1144,9 @@ func main() {
 	}
 	defer metaDB.Close()
 	vlog("metadata database initialized in %s", config.Data)
+
+	// Start cache eviction scheduler if configured
+	start_eviction_scheduler(config.Data, config.EvictOlderThan)
 
 	fileserver := http.FileServer(http.Dir(config.Data))
 

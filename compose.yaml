@@ -5,6 +5,8 @@ services:
       - "8080:8080"
     volumes:
       - ./data:/var/remirror
+    environment:
+      - REMIRROR_EVICT_OLDER_THAN=2880h
     develop:
       watch:
         - path: main.go

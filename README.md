@@ -11,6 +11,8 @@ Caching HTTP proxy for distro and toolchain mirrors. It sits in front of one or 
 - Resilient operation: serves from cache when upstream is unavailable.
 - HCL configuration with env overrides.
 - Multiple upstreams per mirror with basic failover on 404/500/503.
+- Automatic cache eviction: delete cached files older than a configured duration.
+- Range request support: clients can request partial file content.
 
 ## Build and run
 
@@ -35,6 +37,7 @@ Example configuration:
 ```hcl
 listen = ":8080"
 data = "/var/remirror"
+evict_older_than = "720h"  # Delete files not accessed for 30 days
 
 mirrors {
     mirror {
@@ -72,6 +75,7 @@ mirrors {
 
 - `listen`: HTTP bind address, e.g. `":8080"`.
 - `data`: on-disk cache root, e.g. `"/var/remirror"`.
+- `evict_older_than`: Optional. Duration to keep cached files (e.g., `"720h"` for 30 days, `"168h"` for 7 days). Files not accessed within this period are deleted daily. If not set, no eviction occurs. Accepts any valid Go duration format.
 - `mirrors`: list of `mirror` blocks.
 
 Each `mirror` supports:
@@ -98,6 +102,7 @@ Top-level overrides:
 
 - `REMIRROR_LISTEN`
 - `REMIRROR_DATA`
+- `REMIRROR_EVICT_OLDER_THAN`
 
 Mirror overrides use the pattern `REMIRROR_MIRRORS_<name>_<FIELD>`.
 
@@ -114,6 +119,7 @@ Example:
 ```sh
 export REMIRROR_LISTEN=":8080"
 export REMIRROR_DATA="/var/remirror"
+export REMIRROR_EVICT_OLDER_THAN="720h"
 export REMIRROR_MIRRORS_ARCH_PREFIX="/archlinux/"
 export REMIRROR_MIRRORS_ARCH_UPSTREAMS="https://mirror1.example.com,https://mirror2.example.com"
 export REMIRROR_MIRRORS_ARCH_MATCHES='\\.pkg\\.tar\\.zst$:cache,\\.sig$:try'
@@ -133,6 +139,18 @@ This allows package archives and immutable content to be cached permanently (act
 
 The default [remirror.hcl](remirror.hcl) includes `action = "try"` patterns for repo metadata that should always be validated.
 
+## Cache Eviction
+
+When `evict_older_than` is configured, remirror automatically deletes cached files with an `updated_at` timestamp older than the specified duration:
+
+- Eviction runs immediately on startup
+- Subsequent eviction runs daily at midnight (24-hour intervals)
+- Only files tracked in the metadata database are considered
+- Database entries for deleted files are cleaned up automatically
+- If `evict_older_than` is not set or is empty, no eviction occurs
+
+Example: `evict_older_than = "720h"` keeps 30 days of cache, deleting files that haven't been accessed (touched) for more than 30 days.
+
 ## Notes
 
 - Files without matching rules default to `action = "cache"` (cached forever).
@@ -142,6 +160,7 @@ The default [remirror.hcl](remirror.hcl) includes `action = "try"` patterns for 
 - When upstream mirrors are unreachable or return errors, cached versions are served automatically (for "cache" and "try" actions).
 - Range requests are served directly from cache without revalidation.
 - Failed upstream responses with 404/500/503 fall back to cache if available, or retry the next upstream.
+- Cache eviction tracks file access via the `updated_at` column and removes old entries daily.
 
 ## Docker
 
@@ -149,7 +168,7 @@ Build and run locally:
 
 ```sh
 docker build -t remirror .
-docker run --rm -p 8080:8080 -v remirror-data:/var/remirror remirror
+docker run --rm -p 8080:8080 -e REMIRROR_EVICT_OLDER_THAN=720h -v remirror-data:/var/remirror remirror
 ```
 
 Compose:
